@@ -6,8 +6,8 @@
 #include <gtest/gtest.h>
 #include <fstream>
 #include <string>
-#include "../chem/chem_system.h"
-#include "../det/det.h"
+#include "src/chem/chem_system.h"
+#include "src/det/det.h"
 
 /**
  * @class ChemSystemTest

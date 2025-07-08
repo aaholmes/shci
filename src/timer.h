@@ -4,17 +4,23 @@
 #include <string>
 #include <vector>
 
+// Hierarchical timing system for SHCI performance profiling
+// Provides nested timing with memory usage tracking
 class Timer {
  public:
+  // Get singleton timer instance
   static Timer& get_instance() {
     static Timer instance;
     return instance;
   }
 
+  // Start timing a named event (can be nested)
   static void start(const std::string& event);
 
+  // Record checkpoint within current timing event
   static void checkpoint(const std::string& event);
 
+  // End current timing event and print results
   static void end();
 
  private:

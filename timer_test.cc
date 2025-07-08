@@ -6,7 +6,7 @@
 #include <gtest/gtest.h>
 #include <chrono>
 #include <thread>
-#include "../timer.h"
+#include "src/timer.h"
 
 /**
  * @class TimerTest

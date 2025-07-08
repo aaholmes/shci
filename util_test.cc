@@ -6,7 +6,7 @@
 #include <gtest/gtest.h>
 #include <vector>
 #include <string>
-#include "../util.h"
+#include "src/util.h"
 
 /**
  * @class UtilTest
