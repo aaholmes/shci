@@ -91,6 +91,9 @@ class Solver {
 
   std::string get_wf_filename(const double eps_var) const;
 
+  // Generate automated epsilon schedule based on Hamiltonian matrix elements
+  std::vector<double> generate_automated_epsilon_schedule(const double eps_final);
+
   template <class C>
   std::array<double, 2> mapreduce_sum(
       const fgpl::DistHashMap<Det, C, DetHasher>& map,
@@ -340,8 +343,23 @@ void Solver<S>::run_all_variations() {
   if (Parallel::is_master()) {
     printf("Final iteration 0 HF ndets= 1 energy= %.8f\n", system.energy_hf);
   }
-  const auto& eps_vars = Config::get<std::vector<double>>("eps_vars");
-  const auto& eps_vars_schedule = Config::get<std::vector<double>>("eps_vars_schedule");
+  
+  // Get configuration parameters for automated epsilon schedule
+  const bool use_auto_epsilon_schedule = Config::get<bool>("use_auto_epsilon_schedule", true);
+  auto eps_vars = Config::get<std::vector<double>>("eps_vars");
+  auto eps_vars_schedule = Config::get<std::vector<double>>("eps_vars_schedule", std::vector<double>());
+  
+  // Implement automated epsilon schedule if conditions are met
+  if (use_auto_epsilon_schedule && eps_vars_schedule.empty()) {
+    eps_vars_schedule = generate_automated_epsilon_schedule(eps_vars[0]);
+    if (Parallel::is_master()) {
+      printf("Using automated epsilon schedule: ");
+      for (const auto& eps : eps_vars_schedule) {
+        printf("%#.2e ", eps);
+      }
+      printf("\n");
+    }
+  }
   double eps_var_prev = Util::INF;
   for (const auto& det : system.dets) var_dets.set(det);
   auto it_schedule = eps_vars_schedule.begin();
@@ -1414,4 +1432,74 @@ std::string Solver<S>::get_state_suffix(const unsigned i_state) const {
 template <class S>
 std::string Solver<S>::get_wf_filename(const double eps_var) const {
   return Util::str_printf("wf_eps1_%#.2e.dat", eps_var);
+}
+
+template <class S>
+std::vector<double> Solver<S>::generate_automated_epsilon_schedule(const double eps_final) {
+  if (Parallel::is_master()) {
+    printf("Generating automated epsilon schedule with eps_final = %#.2e\n", eps_final);
+  }
+  
+  // Initialize with HF determinant to find connected determinants
+  const Det& det_hf = system.dets[0];
+  
+  double max_H_same = 0.0;   // Maximum |H_ij| for same-spin double excitations
+  double max_H_opp = 0.0;    // Maximum |H_ij| for opposite-spin double excitations
+  
+  // Handler to find maximum Hamiltonian elements for different excitation types
+  const auto& connection_handler = [&](const Det& connected_det, const int n_excite) {
+    if (n_excite == 2) {
+      const double h_ij = std::abs(system.get_hamiltonian_elem(det_hf, connected_det, 2));
+      
+      // Determine if this is a same-spin or opposite-spin excitation
+      const unsigned n_up_diffs = det_hf.up.n_diffs(connected_det.up);
+      const unsigned n_dn_diffs = det_hf.dn.n_diffs(connected_det.dn);
+      
+      if (n_up_diffs == 2 && n_dn_diffs == 0) {
+        // Same-spin up excitation
+        max_H_same = std::max(max_H_same, h_ij);
+      } else if (n_up_diffs == 0 && n_dn_diffs == 2) {
+        // Same-spin down excitation  
+        max_H_same = std::max(max_H_same, h_ij);
+      } else if (n_up_diffs == 1 && n_dn_diffs == 1) {
+        // Opposite-spin excitation
+        max_H_opp = std::max(max_H_opp, h_ij);
+      }
+    }
+  };
+  
+  // Find all double excitations from HF determinant
+  static_cast<void>(system.find_connected_dets(det_hf, Util::INF, 0.0, connection_handler, false));
+  
+  // Synchronize maximum values across MPI processes
+  double max_H_same_global, max_H_opp_global;
+  MPI_Allreduce(&max_H_same, &max_H_same_global, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+  MPI_Allreduce(&max_H_opp, &max_H_opp_global, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+  max_H_same = max_H_same_global;
+  max_H_opp = max_H_opp_global;
+  
+  // Calculate eps0 as minimum of the two maximum values
+  const double eps0 = std::min(max_H_same, max_H_opp);
+  
+  // Calculate intermediate epsilon as geometric mean
+  const double eps_intermediate = std::sqrt(eps0 * eps_final);
+  
+  if (Parallel::is_master()) {
+    printf("Automated schedule: eps0 = %#.2e (max_H_same = %#.2e, max_H_opp = %#.2e)\n", 
+           eps0, max_H_same, max_H_opp);
+    printf("                    eps_intermediate = %#.2e\n", eps_intermediate);
+    printf("                    eps_final = %#.2e\n", eps_final);
+  }
+  
+  // Create the three-stage schedule
+  std::vector<double> schedule;
+  
+  // Only add intermediate stage if it's meaningfully different from endpoints
+  if (eps_intermediate > eps_final * 2.0 && eps_intermediate < eps0 * 0.5) {
+    schedule = {eps0, eps_intermediate};
+  } else {
+    schedule = {eps0};
+  }
+  
+  return schedule;
 }
