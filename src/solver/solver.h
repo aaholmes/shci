@@ -57,6 +57,11 @@ class Solver {
   double eps_pt_max;                            // Maximum perturbation threshold
   size_t bytes_per_det;                         // Memory per determinant
 
+  // Dynamic preconditioner data members
+  std::priority_queue<OffDiagElement> off_diag_heap;  // Max-heap for top-k elements
+  std::vector<OffDiagElement> collected_off_diagonal_elements;  // Final collected elements
+  bool off_diagonal_collection_enabled;               // Whether to collect elements
+
   void run_all_variations();
 
   void run_variation(const double eps_var, const bool until_converged = true);
@@ -88,6 +93,18 @@ class Solver {
   // Generate automated epsilon schedule based on Hamiltonian matrix elements
   std::vector<double> generate_automated_epsilon_schedule(const double eps_final);
 
+
+  // Collect off-diagonal elements during heat-bath step
+  void collect_off_diagonal_elements(
+      const size_t i, const size_t j, 
+      const double H_ij, const double c_i, const double c_j);
+
+  // Finalize collected off-diagonal elements for Davidson
+  void finalize_off_diagonal_collection();
+
+  // Brute force verification of off-diagonal collection (debug only)
+  void verify_off_diagonal_collection_brute_force();
+
   template <class C>
   std::array<double, 2> mapreduce_sum(
       const fgpl::DistHashMap<Det, C, DetHasher>& map,
@@ -100,6 +117,10 @@ void Solver<S>::run() {
   std::setlocale(LC_ALL, "en_US.UTF-8");
   system.setup();
   target_error = Config::get<double>("target_error", 5.0e-5);
+  
+  // Initialize dynamic preconditioner collection
+  off_diagonal_collection_enabled = Config::get<bool>("davidson/use_dynamic_preconditioner", false);
+  
   Result::put("energy_hf", system.energy_hf);
   Timer::end();
 
@@ -469,11 +490,39 @@ void Solver<S>::run_variation(const double eps_var, const bool until_converged) 
             if (system.time_sym && connected_det.up > connected_det.dn) {
               connected_det_reg.reverse_spin();
             }
-            if (var_dets.has(connected_det_reg)) return;
+            
+            // Compute Hamiltonian matrix element first
+            double h_ij = 0.0;
             if (n_excite == 1) {
-              const double h_ai = system.get_hamiltonian_elem(det, connected_det, 1);
-              if (std::abs(h_ai) < eps_min) return;  // Filter out small single excitation.
+              h_ij = system.get_hamiltonian_elem(det, connected_det, 1);
+              if (std::abs(h_ij) < eps_min) return;  // Filter out small single excitation.
+            } else if (n_excite == 2) {
+              h_ij = system.get_hamiltonian_elem(det, connected_det, 2);
             }
+            
+            // Collect off-diagonal element if this determinant is already in variational space
+            if (var_dets.has(connected_det_reg)) {
+              if (off_diagonal_collection_enabled && h_ij != 0.0) {
+                // Find index of connected determinant in current variational space
+                for (size_t j_idx = 0; j_idx < system.dets.size(); j_idx++) {
+                  if (system.dets[j_idx] == connected_det_reg) {
+                    double c_j = system.coefs[0][j_idx];
+                    // Find max coefficient for connected det across all states
+                    for (unsigned i_state = 1; i_state < system.n_states; i_state++) {
+                      const double coef = system.coefs[i_state][j_idx];
+                      if (std::abs(coef) > std::abs(c_j)) c_j = coef;
+                    }
+                    
+                    // Collect off-diagonal element: |c_j * H_ij * c_i|
+                    collect_off_diagonal_elements(i, j_idx, h_ij, max_coef, c_j);
+                    break;
+                  }
+                }
+              }
+              return;
+            }
+            
+            
             dist_new_dets.async_set(connected_det_reg);
           };
           if (second_rejection) {
@@ -512,6 +561,17 @@ void Solver<S>::run_variation(const double eps_var, const bool until_converged) 
       Timer::checkpoint("get next det list");
 
       hamiltonian.update(system);
+    }
+
+    // Finalize off-diagonal element collection for dynamic preconditioner
+    finalize_off_diagonal_collection();
+
+    // Verify collection with brute force (debug only)
+    verify_off_diagonal_collection_brute_force();
+
+    // Pass collected off-diagonal elements to Davidson
+    if (off_diagonal_collection_enabled) {
+      davidson.set_off_diagonal_elements(collected_off_diagonal_elements);
     }
 
     const double davidson_target_error =
@@ -1529,4 +1589,147 @@ std::vector<double> Solver<S>::generate_automated_epsilon_schedule(const double 
   }
   
   return schedule;
+}
+
+template <class S>
+void Solver<S>::collect_off_diagonal_elements(
+    const size_t i, const size_t j, 
+    const double H_ij, const double c_i, const double c_j) {
+  
+  if (!off_diagonal_collection_enabled) return;
+  
+  const double magnitude = std::abs(c_i * H_ij * c_j);
+  const int preconditioner_rank_k = Config::get<int>("davidson/preconditioner_rank_k", 200);
+  
+  // Filter out very small elements for numerical stability
+  if (magnitude < 1e-12) return;
+  
+  OffDiagElement element{i, j, magnitude};
+  
+  if (off_diag_heap.size() < static_cast<size_t>(preconditioner_rank_k)) {
+    // Heap not full, add directly
+    off_diag_heap.push(element);
+  } else if (magnitude > off_diag_heap.top().magnitude) {
+    // New element is larger than smallest in heap, replace
+    off_diag_heap.pop();
+    off_diag_heap.push(element);
+  }
+}
+
+template <class S>
+void Solver<S>::finalize_off_diagonal_collection() {
+  if (!off_diagonal_collection_enabled) return;
+  
+  // Convert heap to sorted vector
+  collected_off_diagonal_elements.clear();
+  collected_off_diagonal_elements.reserve(off_diag_heap.size());
+  
+  while (!off_diag_heap.empty()) {
+    collected_off_diagonal_elements.push_back(off_diag_heap.top());
+    off_diag_heap.pop();
+  }
+  
+  // Sort by magnitude (largest first) for optimal preconditioner construction
+  std::sort(collected_off_diagonal_elements.begin(), collected_off_diagonal_elements.end(),
+            [](const OffDiagElement& a, const OffDiagElement& b) {
+              return a.magnitude > b.magnitude;
+            });
+  
+  if (Parallel::is_master() && !collected_off_diagonal_elements.empty()) {
+    printf("Collected %zu off-diagonal elements for dynamic preconditioner\n", 
+           collected_off_diagonal_elements.size());
+    printf("Largest magnitude: %#.6e, smallest: %#.6e\n",
+           collected_off_diagonal_elements.front().magnitude,
+           collected_off_diagonal_elements.back().magnitude);
+    
+    // Debug: Print top 10 and bottom 10 collected elements
+    const int preconditioner_rank_k = Config::get<int>("davidson/preconditioner_rank_k", 200);
+    if (preconditioner_rank_k <= 50) {  // Only for small debug runs
+      printf("DEBUG: Top 10 collected elements:\n");
+      for (size_t i = 0; i < std::min(10UL, collected_off_diagonal_elements.size()); i++) {
+        const auto& elem = collected_off_diagonal_elements[i];
+        printf("  [%zu] i=%zu, j=%zu, magnitude=%#.6e\n", i, elem.i, elem.j, elem.magnitude);
+      }
+      if (collected_off_diagonal_elements.size() > 10) {
+        printf("DEBUG: Bottom 10 collected elements:\n");
+        size_t start = std::max(10UL, collected_off_diagonal_elements.size() - 10);
+        for (size_t i = start; i < collected_off_diagonal_elements.size(); i++) {
+          const auto& elem = collected_off_diagonal_elements[i];
+          printf("  [%zu] i=%zu, j=%zu, magnitude=%#.6e\n", i, elem.i, elem.j, elem.magnitude);
+        }
+      }
+    }
+  }
+}
+
+template <class S>
+void Solver<S>::verify_off_diagonal_collection_brute_force() {
+  if (!off_diagonal_collection_enabled) return;
+  
+  const int preconditioner_rank_k = Config::get<int>("davidson/preconditioner_rank_k", 200);
+  if (preconditioner_rank_k > 50 || system.dets.size() > 1000) return;  // Only for small debug runs
+  
+  const size_t n_dets = system.dets.size();
+  if (n_dets < 2) return;
+  
+  // Get current eigenvector coefficients
+  const auto& coefs = system.coefs[0];
+  
+  // Brute force: collect ALL off-diagonal elements
+  std::vector<OffDiagElement> all_elements;
+  
+  for (size_t i = 0; i < n_dets; i++) {
+    const auto& row = hamiltonian.matrix.get_row(i);
+    
+    for (size_t k = 0; k < row.size(); k++) {
+      const size_t j = row.get_index(k);
+      const double H_ij = row.get_value(k);
+      
+      if (i == j) continue;  // Skip diagonal elements
+      if (j <= i) continue;  // Only upper triangular
+      
+      if (std::abs(H_ij) < 1e-12) continue;
+      
+      // Get max coefficients for both determinants
+      double c_i_max = coefs[i];
+      double c_j_max = coefs[j];
+      
+      for (unsigned i_state = 1; i_state < system.n_states; i_state++) {
+        if (std::abs(system.coefs[i_state][i]) > std::abs(c_i_max)) c_i_max = system.coefs[i_state][i];
+        if (std::abs(system.coefs[i_state][j]) > std::abs(c_j_max)) c_j_max = system.coefs[i_state][j];
+      }
+      
+      const double magnitude = std::abs(c_i_max * H_ij * c_j_max);
+      
+      if (magnitude > 1e-12) {
+        all_elements.push_back({i, j, magnitude});
+      }
+    }
+  }
+  
+  // Sort all elements by magnitude (largest first)
+  std::sort(all_elements.begin(), all_elements.end(),
+            [](const OffDiagElement& a, const OffDiagElement& b) {
+              return a.magnitude > b.magnitude;
+            });
+  
+  if (Parallel::is_master()) {
+    printf("BRUTE FORCE VERIFICATION:\n");
+    printf("Total off-diagonal elements found: %zu\n", all_elements.size());
+    printf("Expected to collect top %d elements\n", preconditioner_rank_k);
+    
+    if (!all_elements.empty()) {
+      printf("Actual largest magnitude: %#.6e\n", all_elements.front().magnitude);
+      size_t top_k = std::min(static_cast<size_t>(preconditioner_rank_k), all_elements.size());
+      if (top_k > 0) {
+        printf("Actual %zu-th largest magnitude: %#.6e\n", top_k, all_elements[top_k-1].magnitude);
+      }
+      
+      printf("Top 10 actual largest elements:\n");
+      for (size_t i = 0; i < std::min(10UL, all_elements.size()); i++) {
+        const auto& elem = all_elements[i];
+        printf("  [%zu] i=%zu, j=%zu, magnitude=%#.6e\n", i, elem.i, elem.j, elem.magnitude);
+      }
+    }
+  }
 }
