@@ -12,6 +12,10 @@ void Davidson::diagonalize(
     const bool verbose) {
   const double TOLERANCE = target_error;
   const size_t N_ITERATIONS_STORE = 5; // storage per state.
+  
+  // Dynamic preconditioner configuration
+  const bool use_dynamic_preconditioner = Config::get<bool>("davidson/use_dynamic_preconditioner", false);
+  const int preconditioner_rank_k = Config::get<int>("davidson/preconditioner_rank_k", 200);
 
   const size_t dim = initial_vectors[0].size();
   const unsigned n_states = std::min(dim, initial_vectors.size());
@@ -103,13 +107,30 @@ void Davidson::diagonalize(
       }
     }
 
+    // Apply preconditioner (diagonal or dynamic)
+    if (use_dynamic_preconditioner && !off_diagonal_elements.empty()) {
+      // Compute residual vector
+      std::vector<double> residual(dim);
+      for (size_t j = 0; j < dim; j++) {
+        residual[j] = Hw[i_state_precond][j] - lowest_eigenvalues[i_state_precond] * w[i_state_precond][j];
+      }
+      
+      // Apply dynamic preconditioner using Woodbury identity
+      std::vector<double> preconditioned = apply_dynamic_preconditioner(residual, lowest_eigenvalues[i_state_precond], matrix);
+      
+      for (size_t j = 0; j < dim; j++) {
+        v[it_circ][j] = preconditioned[j];
+      }
+    } else {
+      // Original diagonal preconditioner
 #pragma omp parallel for
-    for (size_t j = 0; j < dim; j++) {
-      const double diff_to_diag = lowest_eigenvalues[i_state_precond] - matrix.get_diag(j);  // diag_elems[j];
-      if (std::abs(diff_to_diag) < 1.0e-8) {
-        v[it_circ][j] = 0.;
-      } else {
-        v[it_circ][j] = (Hw[i_state_precond][j] - lowest_eigenvalues[i_state_precond] * w[i_state_precond][j]) / diff_to_diag;
+      for (size_t j = 0; j < dim; j++) {
+        const double diff_to_diag = lowest_eigenvalues[i_state_precond] - matrix.get_diag(j);  // diag_elems[j];
+        if (std::abs(diff_to_diag) < 1.0e-8) {
+          v[it_circ][j] = 0.;
+        } else {
+          v[it_circ][j] = (Hw[i_state_precond][j] - lowest_eigenvalues[i_state_precond] * w[i_state_precond][j]) / diff_to_diag;
+        }
       }
     }
 
@@ -193,4 +214,109 @@ void Davidson::diagonalize(
     for (unsigned i = n_states; i < initial_vectors.size(); i++) 
       lowest_eigenvectors[i] = initial_vectors[i];
   }
+}
+
+std::vector<double> Davidson::apply_dynamic_preconditioner(
+    const std::vector<double>& r, 
+    const double eigenvalue,
+    const SparseMatrix& matrix) {
+  
+  const size_t dim = r.size();
+  const size_t k = off_diagonal_elements.size();
+  
+  if (k == 0) {
+    // Fallback to diagonal preconditioner
+    std::vector<double> result(dim);
+    for (size_t i = 0; i < dim; i++) {
+      const double diff_to_diag = eigenvalue - matrix.get_diag(i);
+      if (std::abs(diff_to_diag) < 1.0e-8) {
+        result[i] = 0.0;
+      } else {
+        result[i] = r[i] / diff_to_diag;
+      }
+    }
+    return result;
+  }
+  
+  // Construct U and V matrices from collected off-diagonal elements
+  // U is k x dim, V is k x dim, each row corresponds to one off-diagonal element
+  Eigen::MatrixXd U = Eigen::MatrixXd::Zero(k, dim);
+  Eigen::MatrixXd V = Eigen::MatrixXd::Zero(k, dim);
+  
+  for (size_t idx = 0; idx < k; idx++) {
+    const auto& elem = off_diagonal_elements[idx];
+    // U matrix: unit vectors for matrix positions
+    U(idx, elem.i) = 1.0;
+    // V matrix: scaled by Hamiltonian matrix element magnitude
+    V(idx, elem.j) = std::sqrt(elem.magnitude);
+  }
+  
+  // Diagonal preconditioner matrix D^(-1)
+  Eigen::VectorXd D_inv(dim);
+  for (size_t i = 0; i < dim; i++) {
+    const double diff_to_diag = eigenvalue - matrix.get_diag(i);
+    if (std::abs(diff_to_diag) < 1.0e-8) {
+      D_inv(i) = 0.0;
+    } else {
+      D_inv(i) = 1.0 / diff_to_diag;
+    }
+  }
+  
+  // Convert residual to Eigen vector
+  Eigen::VectorXd r_vec = Eigen::Map<const Eigen::VectorXd>(r.data(), dim);
+  
+  // Apply Woodbury matrix identity: (D + UV^T)^(-1) = D^(-1) - D^(-1)U(I + V^TD^(-1}U)^(-1}V^TD^(-1)
+  
+  // Step 1: D^(-1) * r
+  Eigen::VectorXd D_inv_r = D_inv.cwiseProduct(r_vec);
+  
+  // Step 2: V^T * D^(-1) * U (k x k matrix)
+  Eigen::MatrixXd VT_D_inv_U = Eigen::MatrixXd::Zero(k, k);
+  for (size_t i = 0; i < k; i++) {
+    for (size_t j = 0; j < k; j++) {
+      double sum = 0.0;
+      for (size_t d = 0; d < dim; d++) {
+        sum += V(i, d) * D_inv(d) * U(j, d);
+      }
+      VT_D_inv_U(i, j) = sum;
+    }
+  }
+  
+  // Step 3: (I + V^T * D^(-1) * U)^(-1)
+  Eigen::MatrixXd I_plus_VT_D_inv_U = Eigen::MatrixXd::Identity(k, k) + VT_D_inv_U;
+  Eigen::MatrixXd inv_term = I_plus_VT_D_inv_U.inverse();
+  
+  // Step 4: V^T * D^(-1) * r
+  Eigen::VectorXd VT_D_inv_r = Eigen::VectorXd::Zero(k);
+  for (size_t i = 0; i < k; i++) {
+    double sum = 0.0;
+    for (size_t d = 0; d < dim; d++) {
+      sum += V(i, d) * D_inv(d) * r_vec(d);
+    }
+    VT_D_inv_r(i) = sum;
+  }
+  
+  // Step 5: (I + V^T * D^(-1) * U)^(-1) * V^T * D^(-1) * r
+  Eigen::VectorXd inv_VT_D_inv_r = inv_term * VT_D_inv_r;
+  
+  // Step 6: D^(-1) * U * (I + V^T * D^(-1) * U)^(-1) * V^T * D^(-1) * r
+  Eigen::VectorXd correction = Eigen::VectorXd::Zero(dim);
+  for (size_t d = 0; d < dim; d++) {
+    double sum = 0.0;
+    for (size_t i = 0; i < k; i++) {
+      sum += U(i, d) * inv_VT_D_inv_r(i);
+    }
+    correction(d) = D_inv(d) * sum;
+  }
+  
+  // Final result: D^(-1) * r - correction
+  Eigen::VectorXd result_vec = D_inv_r - correction;
+  
+  // Convert back to std::vector
+  std::vector<double> result(dim);
+  for (size_t i = 0; i < dim; i++) {
+    result[i] = result_vec(i);
+  }
+  
+  return result;
 }
