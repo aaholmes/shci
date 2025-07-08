@@ -29,39 +29,33 @@
 #include "hc_server.h"
 #include "uncert_result.h"
 
+// Main SHCI solver class
+// Performs variational optimization and perturbative corrections
 template <class S>
 class Solver {
  public:
+  // Run complete SHCI calculation (variation + perturbation)
   void run();
 
+  // Run orbital optimization (natural orbitals + optimized orbitals)
   void optimization_run();
 
  private:
-  S system;
-
-  Hamiltonian<S> hamiltonian;
-
-  std::vector<double> eps_tried_prev;
-
-  fgpl::HashSet<Det, DetHasher> var_dets;
-
-  size_t pt_mem_avail;
-
-  size_t var_iteration_global;
-
-  double eps_var_min;
-
-  double eps_pt;
-
-  double eps_pt_dtm;
-
-  double eps_pt_psto;
-
-  double target_error;
-
-  double eps_pt_max;
-
-  size_t bytes_per_det;
+  S system;                                      // Quantum system (ChemSystem, HegSystem, etc.)
+  Hamiltonian<S> hamiltonian;                    // Sparse Hamiltonian matrix
+  std::vector<double> eps_tried_prev;            // Previous screening thresholds
+  fgpl::HashSet<Det, DetHasher> var_dets;        // Variational determinant set
+  
+  // Memory and convergence parameters
+  size_t pt_mem_avail;                          // Available memory for perturbation
+  size_t var_iteration_global;                  // Global variation iteration counter
+  double eps_var_min;                           // Minimum variational threshold
+  double eps_pt;                                // Perturbation threshold (stochastic)
+  double eps_pt_dtm;                            // Perturbation threshold (deterministic)
+  double eps_pt_psto;                           // Perturbation threshold (pseudo-stochastic)
+  double target_error;                          // Target energy error
+  double eps_pt_max;                            // Maximum perturbation threshold
+  size_t bytes_per_det;                         // Memory per determinant
 
   void run_all_variations();
 

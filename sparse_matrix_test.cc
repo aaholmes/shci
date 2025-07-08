@@ -6,7 +6,7 @@
 #include <gtest/gtest.h>
 #include <vector>
 #include <random>
-#include "../solver/sparse_matrix.h"
+#include "src/solver/sparse_matrix.h"
 
 /**
  * @class SparseMatrixTest
