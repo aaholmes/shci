@@ -352,9 +352,14 @@ void Solver<S>::run_all_variations() {
   // Implement automated epsilon schedule if conditions are met
   if (use_auto_epsilon_schedule && eps_vars_schedule.empty()) {
     eps_vars_schedule = generate_automated_epsilon_schedule(eps_vars[0]);
+    // Replace eps_vars with the automated schedule + original eps_vars
+    auto combined_schedule = eps_vars_schedule;
+    combined_schedule.insert(combined_schedule.end(), eps_vars.begin(), eps_vars.end());
+    eps_vars = combined_schedule;
+    eps_vars_schedule.clear(); // Clear to avoid double processing
     if (Parallel::is_master()) {
       printf("Using automated epsilon schedule: ");
-      for (const auto& eps : eps_vars_schedule) {
+      for (const auto& eps : eps_vars) {
         printf("%#.2e ", eps);
       }
       printf("\n");
