@@ -47,7 +47,22 @@ void ChemSystem::setup(const bool load_integrals_from_file) {
   setup_singles_queue();
   Timer::end();
 
+  // Initialize orbital partitioning configuration
+  use_orbital_partitioning = Config::get<bool>("use_orbital_partitioning", false);
+  partitioning_threshold = Config::get<int>("partitioning_threshold", 500);
+  
+  if (use_orbital_partitioning) {
+    Timer::start("setup orbital partitioning");
+    setup_orbital_partitioning();
+    Timer::end();
+  }
+
   dets.push_back(integrals.det_hf);
+  
+  // Populate orbital partitioning screener for HF determinant
+  if (use_orbital_partitioning) {
+    populate_screener(integrals.det_hf, 0);
+  }
 
   coefs.resize(n_states);
   coefs[0].push_back(1.0);
@@ -632,6 +647,14 @@ void ChemSystem::post_variation(std::vector<std::vector<size_t>>& connections) {
     const double s2 = get_s2(coefs[0]);
     Result::put("s2", s2);
   }
+  
+  // Recalculate orbital partitioning with full variational wavefunction
+  if (use_orbital_partitioning) {
+    recalculate_orbital_partitioning();
+  }
+  
+  // Analyze orbital partitioning screening effectiveness
+  analyze_screening_effectiveness();
 }
 
 void ChemSystem::post_variation_optimization(
@@ -820,4 +843,261 @@ double ChemSystem::get_e_hf_1b() const {
     for (const auto p : occ_orbs_dn) e_hf_1b += integrals.get_1b(p, p);
   }
   return e_hf_1b;
+}
+
+void ChemSystem::setup_orbital_partitioning() {
+  if (Parallel::is_master()) {
+    printf("Setting up orbital partitioning for same-spin screening...\n");
+  }
+  
+  // Initialize with simple ordering initially - will recalculate after variation
+  sorted_beta_orbitals.clear();
+  for (unsigned orb = 0; orb < n_orbs; orb++) {
+    sorted_beta_orbitals.push_back(orb);
+  }
+  
+  // Initialize 5 hash maps for the screening
+  same_spin_screener.clear();
+  same_spin_screener.resize(5);
+  
+  if (Parallel::is_master()) {
+    printf("Orbital partitioning setup complete. %d orbitals in 5 groups.\n", n_orbs);
+    printf("Note: Orbital ordering will be optimized after variational calculation.\n\n");
+  }
+}
+
+void ChemSystem::recalculate_orbital_partitioning() {
+  if (!use_orbital_partitioning || dets.empty()) return;
+  
+  if (Parallel::is_master()) {
+    printf("Recalculating orbital partitioning with full variational wavefunction...\n");
+  }
+  
+  // Calculate true occupation probabilities from all determinants
+  std::vector<double> orbital_occupations(n_orbs, 0.0);
+  double total_coef_squared = 0.0;
+  
+  // Sum over all determinants weighted by coefficient squared
+  for (size_t det_idx = 0; det_idx < dets.size(); det_idx++) {
+    double coef_sq = coefs[0][det_idx] * coefs[0][det_idx];  // Use first state
+    total_coef_squared += coef_sq;
+    
+    // Count beta orbital occupations
+    for (unsigned orb = 0; orb < n_orbs; orb++) {
+      if (dets[det_idx].dn.has(orb)) {
+        orbital_occupations[orb] += coef_sq;
+      }
+    }
+  }
+  
+  // Normalize to get probabilities
+  for (unsigned orb = 0; orb < n_orbs; orb++) {
+    orbital_occupations[orb] /= total_coef_squared;
+  }
+  
+  // Create pairs of |p_i - 0.5| and orbital index for sorting
+  std::vector<std::pair<double, unsigned>> orbital_probs;
+  for (unsigned orb = 0; orb < n_orbs; orb++) {
+    double p_i = orbital_occupations[orb];
+    orbital_probs.push_back({std::abs(p_i - 0.5), orb});
+  }
+  
+  // Sort by increasing |p_i - 0.5| to prioritize most delocalized orbitals
+  std::sort(orbital_probs.begin(), orbital_probs.end());
+  
+  // Update sorted orbital indices
+  sorted_beta_orbitals.clear();
+  for (const auto& pair : orbital_probs) {
+    sorted_beta_orbitals.push_back(pair.second);
+  }
+  
+  if (Parallel::is_master()) {
+    printf("\n=== ORBITAL PARTITIONING DISTRIBUTION (from %zu determinants) ===\n", dets.size());
+    printf("Orbitals sorted by increasing |p_i - 0.5| (most delocalized first):\n");
+    
+    std::vector<std::vector<unsigned>> groups(5);
+    for (int orb_idx = 0; orb_idx < static_cast<int>(n_orbs); orb_idx++) {
+      unsigned orb = sorted_beta_orbitals[orb_idx];
+      double p_i = orbital_occupations[orb];
+      
+      // Determine group assignment using serpentine pattern
+      int assigned_group;
+      int cycle_pos = orb_idx % 10;
+      if (cycle_pos < 5) {
+        assigned_group = cycle_pos;
+      } else {
+        assigned_group = 9 - cycle_pos;
+      }
+      
+      groups[assigned_group].push_back(orb);
+      printf("Orbital %2d: p_i = %.4f, |p_i - 0.5| = %.4f, assigned to group %d\n", 
+             orb, p_i, std::abs(p_i - 0.5), assigned_group);
+    }
+    
+    printf("\nGroup distributions:\n");
+    for (int g = 0; g < 5; g++) {
+      printf("Group %d (%zu orbitals): ", g, groups[g].size());
+      for (unsigned orb : groups[g]) {
+        printf("%d(%.3f) ", orb, orbital_occupations[orb]);
+      }
+      printf("\n");
+    }
+    printf("===============================================\n\n");
+  }
+  
+  // Clear and rebuild hash maps with new orbital ordering
+  for (int group = 0; group < 5; group++) {
+    same_spin_screener[group].clear();
+  }
+  
+  // Repopulate screener with all determinants using new orbital ordering
+  for (size_t det_idx = 0; det_idx < dets.size(); det_idx++) {
+    populate_screener(dets[det_idx], static_cast<int>(det_idx));
+  }
+}
+
+void ChemSystem::populate_screener(const Det& det, int det_id) {
+  if (!use_orbital_partitioning) return;
+  
+  // Compute occupation keys for all 5 groups and add det_id to appropriate buckets
+  for (int group = 0; group < 5; group++) {
+    uint64_t key = compute_occupation_key(det, group);
+    same_spin_screener[group][key].push_back(det_id);
+  }
+}
+
+uint64_t ChemSystem::compute_occupation_key(const Det& det, int group_id) const {
+  uint64_t key = 0;
+  
+  // Serpentine round-robin dealing: 1,2,3,4,5,5,4,3,2,1,...
+  int orb_idx = 0;
+  for (unsigned orb : sorted_beta_orbitals) {
+    int assigned_group;
+    int cycle_pos = orb_idx % 10;  // 10-element cycle: 0,1,2,3,4,4,3,2,1,0
+    if (cycle_pos < 5) {
+      assigned_group = cycle_pos;
+    } else {
+      assigned_group = 9 - cycle_pos;  // 4,3,2,1,0
+    }
+    
+    if (assigned_group == group_id) {
+      // Add this orbital's occupation to the key
+      if (det.dn.has(orb)) {
+        key |= (1ULL << (orb % 64));  // Set bit for occupied orbital
+      }
+    }
+    orb_idx++;
+  }
+  
+  return key;
+}
+
+void ChemSystem::analyze_screening_effectiveness() const {
+  if (!use_orbital_partitioning) {
+    if (Parallel::is_master()) {
+      printf("Orbital partitioning is disabled - no analysis available.\n");
+    }
+    return;
+  }
+  
+  if (Parallel::is_master()) {
+    printf("\n=== ORBITAL PARTITIONING SCREENING ANALYSIS ===\n");
+    printf("Total determinants: %zu\n", dets.size());
+    printf("Partitioning threshold: %d\n", partitioning_threshold);
+    
+    // Group determinants by alpha string
+    std::unordered_map<HalfDet, std::vector<int>, HalfDetHasher> alpha_to_det_ids;
+    for (size_t i = 0; i < dets.size(); i++) {
+      alpha_to_det_ids[dets[i].up].push_back(i);
+    }
+    
+    printf("Number of unique alpha strings: %zu\n", alpha_to_det_ids.size());
+    
+    int large_alpha_groups = 0;
+    int max_alpha_group_size = 0;
+    int total_screening_benefit = 0;
+    int max_screening_compression = 0;
+    
+    for (const auto& entry : alpha_to_det_ids) {
+      const auto& beta_det_ids = entry.second;
+      int alpha_group_size = beta_det_ids.size();
+      max_alpha_group_size = std::max(max_alpha_group_size, alpha_group_size);
+      
+      if (alpha_group_size >= partitioning_threshold) {
+        large_alpha_groups++;
+        
+        // Analyze screening compression for this alpha group
+        std::vector<std::unordered_map<uint64_t, int>> group_key_counts(5);
+        
+        // Count determinants per screening key for each group
+        for (int det_id : beta_det_ids) {
+          const Det& det = dets[det_id];
+          for (int group = 0; group < 5; group++) {
+            uint64_t key = compute_occupation_key(det, group);
+            group_key_counts[group][key]++;
+          }
+        }
+        
+        // Calculate screening effectiveness: find unique pairs across all groups
+        std::set<std::pair<int, int>> candidate_pairs;
+        for (int group = 0; group < 5; group++) {
+          for (const auto& bucket : group_key_counts[group]) {
+            const auto& det_ids_in_bucket = [&]() {
+              std::vector<int> ids_in_bucket;
+              for (int det_id : beta_det_ids) {
+                if (compute_occupation_key(dets[det_id], group) == bucket.first) {
+                  ids_in_bucket.push_back(det_id);
+                }
+              }
+              return ids_in_bucket;
+            }();
+            
+            // Add all unique pairs within this bucket
+            for (size_t i = 0; i < det_ids_in_bucket.size(); i++) {
+              for (size_t j = i + 1; j < det_ids_in_bucket.size(); j++) {
+                int det1 = det_ids_in_bucket[i];
+                int det2 = det_ids_in_bucket[j];
+                candidate_pairs.insert({std::min(det1, det2), std::max(det1, det2)});
+              }
+            }
+          }
+        }
+        
+        int screened_pair_count = candidate_pairs.size();
+        
+        // Original: M*(M-1)/2 pairs, Screened: actual unique pairs found
+        int original_pairs = alpha_group_size * (alpha_group_size - 1) / 2;
+        int benefit = original_pairs - screened_pair_count;
+        
+        total_screening_benefit += benefit;
+        max_screening_compression = std::max(max_screening_compression, benefit);
+        
+        printf("Alpha group size: %d, Screened pairs: %d, Benefit: %d pairs avoided (%.1f%% reduction)\n", 
+               alpha_group_size, screened_pair_count, benefit, 
+               100.0 * benefit / original_pairs);
+      }
+    }
+    
+    printf("\nSCREENING STATISTICS:\n");
+    printf("Alpha groups >= threshold: %d\n", large_alpha_groups);
+    printf("Max alpha group size: %d\n", max_alpha_group_size);
+    printf("Total screening benefit: %d pair checks avoided\n", total_screening_benefit);
+    printf("Max single group compression: %d pairs\n", max_screening_compression);
+    
+    // Analysis of screening hash map utilization
+    printf("\nSCREENING HASH MAP STATISTICS:\n");
+    for (int group = 0; group < 5; group++) {
+      printf("Group %d: %zu unique keys, %zu total entries\n", 
+             group, same_spin_screener[group].size(),
+             [&]() {
+               size_t total = 0;
+               for (const auto& bucket : same_spin_screener[group]) {
+                 total += bucket.second.size();
+               }
+               return total;
+             }());
+    }
+    
+    printf("===============================================\n\n");
+  }
 }

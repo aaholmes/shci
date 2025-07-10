@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <unordered_map>
 #include "../base_system.h"
 #include "../config.h"
 #include "../solver/sparse_matrix.h"
@@ -68,6 +69,15 @@ class ChemSystem : public BaseSystem {
 
   bool enforce_active_space;
 
+public:
+  // Orbital partitioning for same-spin screening
+  std::vector<std::unordered_map<uint64_t, std::vector<int>>> same_spin_screener;
+  std::vector<unsigned> sorted_beta_orbitals;
+  bool use_orbital_partitioning;
+  int partitioning_threshold;
+
+private:
+
   // setup sym orbs
   void setup_sym_orbs();
 
@@ -75,6 +85,27 @@ class ChemSystem : public BaseSystem {
 
   // setup singles queue
   void setup_singles_queue();
+
+  // setup orbital partitioning for same-spin screening  
+  void setup_orbital_partitioning();
+  
+  // recalculate orbital partitioning with full wavefunction
+  void recalculate_orbital_partitioning();
+
+public:
+  // populate screener during heat-bath selection
+  void populate_screener(const Det& det, int det_id);
+
+private:
+
+public:
+  // compute orbital occupation key for given group
+  uint64_t compute_occupation_key(const Det& det, int group_id) const;
+  
+  // analyze screening effectiveness
+  void analyze_screening_effectiveness() const;
+
+private:
 
   PointGroup get_point_group(const std::string& str) const;
 

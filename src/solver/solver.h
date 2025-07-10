@@ -569,6 +569,10 @@ void Solver<S>::run_variation(const double eps_var, const bool until_converged) 
         dist_new_dets.for_each_serial([&](const Det& connected_det, const size_t) {
           var_dets.set(connected_det);
           system.dets.push_back(connected_det);
+          
+          // Populate orbital partitioning screener for new determinant
+          system.populate_screener(connected_det, system.dets.size() - 1);
+          
 	  // initialize as unit vectors 
           for (unsigned i_state = 0; i_state < system.n_states; i_state++) {
             if (i_state == 0 || n_dets > 50) {
