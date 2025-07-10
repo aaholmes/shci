@@ -15,7 +15,7 @@ Arrow is a research program rather than a fully tested catch-all software packag
 ## History and Authorship
 The Heat-Bath Configuration Interaction (HCI) method was conceived, implemented, and first described by **Adam A. Holmes** while he was a student in the **Umrigar** group at Cornell. The subsequent semistochastic variant (SHCI) was developed through a collaborative effort with **Sandeep Sharma** and **Ali Alavi** at the University of Colorado and the Max Planck Institute. Since then the development of SHCI has been a joint effort between the Umrigar group and the Sharma group, where Holmes was a postdoc.
 
-**Arrow** is the modern, high-performance C++ implementation of these methods. It was first implemented by **Junhao Li** and was later greatly extended by **Yuan Yao** and **Tyler Anderson**. It contains improved versions of the algorithms that were first realized in Holmes's original FORTRAN implementation. All authors, aside from Sharma and Alavi, were at Cornell when they first contributed.
+**Arrow** is the modern, high-performance C++ implementation of these methods. It was first implemented by **Junhao Li** and was later greatly extended by **Yuan Yao** and **Tyler Anderson**. It contains improved versions of the algorithms that were first realized in Holmes's original FORTRAN implementation, which was parallelized by **Matt Otten**. All authors, aside from Sharma and Alavi, were at Cornell when they first contributed.
 
 ## Citations
 Any papers that use Arrow should cite the following foundational papers:
