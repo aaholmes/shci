@@ -1476,6 +1476,69 @@ void Solver<S>::print_dets_info() const {
     double sum_orb_occupation = std::accumulate(orb_occupations.begin(), orb_occupations.end(), 0.0);
     printf("Sum orbitals c^2: %.8f\n", sum_orb_occupation);
   
+    // Analyze determinants sharing same alpha/beta half-determinants
+    if (i_state == 0) {  // Only print for first state to avoid redundancy
+      std::unordered_map<HalfDet, size_t, HalfDetHasher> alpha_counts;
+      std::unordered_map<HalfDet, size_t, HalfDetHasher> beta_counts;
+      
+      for (const auto& det : system.dets) {
+        alpha_counts[det.up]++;
+        beta_counts[det.dn]++;
+      }
+      
+      // Find maximum sharing
+      size_t max_alpha_share = 0;
+      size_t max_beta_share = 0;
+      HalfDet most_shared_alpha;
+      HalfDet most_shared_beta;
+      
+      for (const auto& pair : alpha_counts) {
+        if (pair.second > max_alpha_share) {
+          max_alpha_share = pair.second;
+          most_shared_alpha = pair.first;
+        }
+      }
+      
+      for (const auto& pair : beta_counts) {
+        if (pair.second > max_beta_share) {
+          max_beta_share = pair.second;
+          most_shared_beta = pair.first;
+        }
+      }
+      
+      printf("----------------------------------------\n");
+      printf("Half-determinant sharing analysis:\n");
+      printf("Unique alpha half-dets: %zu\n", alpha_counts.size());
+      printf("Unique beta half-dets: %zu\n", beta_counts.size());
+      printf("Max dets sharing same alpha: %zu\n", max_alpha_share);
+      printf("Max dets sharing same beta: %zu\n", max_beta_share);
+      
+      // Print distribution of sharing
+      std::map<size_t, size_t> alpha_share_dist;
+      std::map<size_t, size_t> beta_share_dist;
+      
+      for (const auto& pair : alpha_counts) {
+        alpha_share_dist[pair.second]++;
+      }
+      for (const auto& pair : beta_counts) {
+        beta_share_dist[pair.second]++;
+      }
+      
+      printf("\nAlpha sharing distribution (# shared -> count):\n");
+      for (const auto& pair : alpha_share_dist) {
+        if (pair.first >= 10 || pair.second >= 10) {  // Only print significant entries
+          printf("  %zu dets shared -> %zu alpha half-dets\n", pair.first, pair.second);
+        }
+      }
+      
+      printf("\nBeta sharing distribution (# shared -> count):\n");
+      for (const auto& pair : beta_share_dist) {
+        if (pair.first >= 10 || pair.second >= 10) {  // Only print significant entries
+          printf("  %zu dets shared -> %zu beta half-dets\n", pair.first, pair.second);
+        }
+      }
+    }
+  
     // Print most important dets.
     printf("----------------------------------------\n");
     printf("Most important dets:\n");
