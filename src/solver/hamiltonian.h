@@ -2,6 +2,7 @@
 
 #include <fgpl/src/dist_range.h>
 #include <string>
+#include <set>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -457,14 +458,51 @@ void Hamiltonian<S>::update_matrix(const S& system) {
         const auto& alpha = det.up;
         const size_t alpha_id = alpha_to_id[alpha];
         const auto& beta_dets = alpha_id_to_det_ids[alpha_id];
-        for (auto it = beta_dets.begin(); it != beta_dets.end(); it++) {
-          const size_t beta_det_id = *it;
-          if (beta_det_id < start_id) continue;
-          const auto& connected_det = system.dets[beta_det_id];
-          const double H = time_sym ? system.get_hamiltonian_elem_time_sym(det, connected_det, -1)
-                                    : system.get_hamiltonian_elem(det, connected_det, -1);
-          if (std::abs(H) < Util::EPS) continue;
-          matrix.append_elem(det_id, beta_det_id, H);
+        
+        // Adaptive orbital partitioning screening for same-spin excitations
+        if (system.use_orbital_partitioning && beta_dets.size() >= static_cast<size_t>(system.partitioning_threshold)) {
+          // Use orbital partitioning screening for large connection lists
+          std::set<std::pair<size_t, size_t>> candidate_pairs;
+          
+          // Check all 5 hash maps for potential connections
+          for (int group = 0; group < 5; group++) {
+            const auto& group_map = system.same_spin_screener[group];
+            uint64_t current_key = system.compute_occupation_key(det, group);
+            
+            auto bucket_it = group_map.find(current_key);
+            if (bucket_it != group_map.end()) {
+              const auto& bucket_dets = bucket_it->second;
+              
+              // For each determinant in this bucket, check if it's in beta_dets
+              for (int bucket_det_id : bucket_dets) {
+                if (std::find(beta_dets.begin(), beta_dets.end(), bucket_det_id) != beta_dets.end()) {
+                  candidate_pairs.insert({det_id, bucket_det_id});
+                }
+              }
+            }
+          }
+          
+          // Process only the candidate pairs
+          for (const auto& pair : candidate_pairs) {
+            const size_t beta_det_id = pair.second;
+            if (beta_det_id < start_id) continue;
+            const auto& connected_det = system.dets[beta_det_id];
+            const double H = time_sym ? system.get_hamiltonian_elem_time_sym(det, connected_det, -1)
+                                      : system.get_hamiltonian_elem(det, connected_det, -1);
+            if (std::abs(H) < Util::EPS) continue;
+            matrix.append_elem(det_id, beta_det_id, H);
+          }
+        } else {
+          // Use original algorithm for small connection lists
+          for (auto it = beta_dets.begin(); it != beta_dets.end(); it++) {
+            const size_t beta_det_id = *it;
+            if (beta_det_id < start_id) continue;
+            const auto& connected_det = system.dets[beta_det_id];
+            const double H = time_sym ? system.get_hamiltonian_elem_time_sym(det, connected_det, -1)
+                                      : system.get_hamiltonian_elem(det, connected_det, -1);
+            if (std::abs(H) < Util::EPS) continue;
+            matrix.append_elem(det_id, beta_det_id, H);
+          }
         }
         if (time_sym && beta_id_to_det_ids.size() > alpha_id && det.up != det.dn) {
           const auto& beta_dets = beta_id_to_det_ids[alpha_id];

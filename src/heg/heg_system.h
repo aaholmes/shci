@@ -1,5 +1,6 @@
 #pragma once
 
+#include <unordered_map>
 #include "../base_system.h"
 #include "k_points.h"
 
@@ -17,6 +18,13 @@ class HegSystem : public BaseSystem {
   double get_hamiltonian_elem(const Det&, const Det&, const int) const override;
 
   void update_diag_helper() override {}
+
+  // Orbital partitioning stubs (not implemented for HEG)
+  void populate_screener(const Det& det, int det_id) {}
+  uint64_t compute_occupation_key(const Det& det, int group_id) const { return 0; }
+  bool use_orbital_partitioning = false;
+  int partitioning_threshold = 500;
+  std::vector<std::unordered_map<uint64_t, std::vector<int>>> same_spin_screener;
 
  private:
   double r_cut;
