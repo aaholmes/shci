@@ -15,6 +15,8 @@
 #include <numeric>
 #include <queue>
 #include <random>
+#include <mutex>
+#include <unordered_map>
 
 #include "../config.h"
 #include "../det/det.h"
@@ -61,6 +63,17 @@ class Solver {
   std::priority_queue<OffDiagElement> off_diag_heap;  // Max-heap for top-k elements
   std::vector<OffDiagElement> collected_off_diagonal_elements;  // Final collected elements
   bool off_diagonal_collection_enabled;               // Whether to collect elements
+  std::mutex off_diag_mutex;                          // Thread safety for collection
+  
+  // Shadow wavefunction data members
+  struct Connection {
+    Det new_det;   // New determinant
+    size_t j;      // Old determinant index
+    double H_ij;   // Hamiltonian matrix element
+  };
+  std::vector<Connection> important_connections;      // Connections from variational selection
+  std::mutex connections_mutex;                       // Thread safety for connections
+  bool use_shadow_wavefunction;                       // Whether to use shadow wavefunction technique
 
   void run_all_variations();
 
@@ -104,6 +117,9 @@ class Solver {
 
   // Brute force verification of off-diagonal collection (debug only)
   void verify_off_diagonal_collection_brute_force();
+  
+  // Prepare shadow wavefunction and select top-k off-diagonal elements
+  void prepare_shadow_wavefunction_preconditioner();
 
   template <class C>
   std::array<double, 2> mapreduce_sum(
@@ -120,6 +136,7 @@ void Solver<S>::run() {
   
   // Initialize dynamic preconditioner collection
   off_diagonal_collection_enabled = Config::get<bool>("davidson/use_dynamic_preconditioner", false);
+  use_shadow_wavefunction = Config::get<bool>("davidson/use_shadow_wavefunction", true);
   
   Result::put("energy_hf", system.energy_hf);
   Timer::end();
@@ -468,6 +485,11 @@ void Solver<S>::run_variation(const double eps_var, const bool until_converged) 
   while (!converged) {
     eps_tried_prev.resize(n_dets, Util::INF);
     if (until_converged) Timer::start(Util::str_printf("#%zu", iteration + 1));
+    
+    // Clear important connections for shadow wavefunction
+    if (use_shadow_wavefunction) {
+      important_connections.clear();
+    }
 
     // Random execution and broadcast.
     if (!dets_converged) {
@@ -522,6 +544,12 @@ void Solver<S>::run_variation(const double eps_var, const bool until_converged) 
               return;
             }
             
+            // Store connection for shadow wavefunction technique
+            if (use_shadow_wavefunction && h_ij != 0.0) {
+              std::lock_guard<std::mutex> lock(connections_mutex);
+              important_connections.push_back({connected_det_reg, i, h_ij});
+            }
+            
             
             dist_new_dets.async_set(connected_det_reg);
           };
@@ -564,7 +592,13 @@ void Solver<S>::run_variation(const double eps_var, const bool until_converged) 
     }
 
     // Finalize off-diagonal element collection for dynamic preconditioner
-    finalize_off_diagonal_collection();
+    if (use_shadow_wavefunction && iteration == 0) {
+      // Use shadow wavefunction for first iteration
+      prepare_shadow_wavefunction_preconditioner();
+    } else {
+      // Use regular collection for subsequent iterations
+      finalize_off_diagonal_collection();
+    }
 
     // Verify collection with brute force (debug only)
     verify_off_diagonal_collection_brute_force();
@@ -1598,13 +1632,20 @@ void Solver<S>::collect_off_diagonal_elements(
   
   if (!off_diagonal_collection_enabled) return;
   
+  // Bounds checking to prevent crashes
+  if (i >= system.dets.size() || j >= system.dets.size()) return;
+  if (i == j) return;  // Skip diagonal elements
+  
   const double magnitude = std::abs(c_i * H_ij * c_j);
   const int preconditioner_rank_k = Config::get<int>("davidson/preconditioner_rank_k", 200);
   
   // Filter out very small elements for numerical stability
-  if (magnitude < 1e-12) return;
+  if (magnitude < 1e-12 || !std::isfinite(magnitude)) return;
   
-  OffDiagElement element{i, j, magnitude};
+  OffDiagElement element{i, j, H_ij, magnitude};
+  
+  // Thread-safe collection
+  std::lock_guard<std::mutex> lock(off_diag_mutex);
   
   if (off_diag_heap.size() < static_cast<size_t>(preconditioner_rank_k)) {
     // Heap not full, add directly
@@ -1641,6 +1682,23 @@ void Solver<S>::finalize_off_diagonal_collection() {
     printf("Largest magnitude: %#.6e, smallest: %#.6e\n",
            collected_off_diagonal_elements.front().magnitude,
            collected_off_diagonal_elements.back().magnitude);
+    
+    // Debug: Show H_ij values
+    double min_h = std::abs(collected_off_diagonal_elements[0].h_ij);
+    double max_h = std::abs(collected_off_diagonal_elements[0].h_ij);
+    for (const auto& elem : collected_off_diagonal_elements) {
+      min_h = std::min(min_h, std::abs(elem.h_ij));
+      max_h = std::max(max_h, std::abs(elem.h_ij));
+    }
+    printf("DEBUG: |H_ij| range: [%#.6e, %#.6e]\n", min_h, max_h);
+    
+    // Show first few elements with H_ij values
+    printf("DEBUG: First 3 elements: ");
+    for (size_t i = 0; i < std::min(size_t(3), collected_off_diagonal_elements.size()); i++) {
+      const auto& elem = collected_off_diagonal_elements[i];
+      printf("(i=%zu,j=%zu,H=%.3e,mag=%.3e) ", elem.i, elem.j, elem.h_ij, elem.magnitude);
+    }
+    printf("\n");
     
     // Debug: Print top 10 and bottom 10 collected elements
     const int preconditioner_rank_k = Config::get<int>("davidson/preconditioner_rank_k", 200);
@@ -1702,7 +1760,7 @@ void Solver<S>::verify_off_diagonal_collection_brute_force() {
       const double magnitude = std::abs(c_i_max * H_ij * c_j_max);
       
       if (magnitude > 1e-12) {
-        all_elements.push_back({i, j, magnitude});
+        all_elements.push_back({i, j, H_ij, magnitude});
       }
     }
   }
@@ -1731,5 +1789,119 @@ void Solver<S>::verify_off_diagonal_collection_brute_force() {
         printf("  [%zu] i=%zu, j=%zu, magnitude=%#.6e\n", i, elem.i, elem.j, elem.magnitude);
       }
     }
+  }
+}
+
+template <class S>
+void Solver<S>::prepare_shadow_wavefunction_preconditioner() {
+  if (!use_shadow_wavefunction || important_connections.empty()) {
+    return;
+  }
+  
+  const int preconditioner_rank_k = Config::get<int>("davidson/preconditioner_rank_k", 200);
+  const size_t n_dets = system.get_n_dets();
+  
+  // Step 1: Build a map from determinant to index for fast lookup
+  std::unordered_map<Det, size_t, DetHasher> det_to_index;
+  for (size_t i = 0; i < n_dets; i++) {
+    det_to_index[system.dets[i]] = i;
+  }
+  
+  // Step 2: Construct shadow CI vector c_shadow
+  std::vector<double> c_shadow(n_dets);
+  
+  // Copy old coefficients (already have correct values)
+  for (size_t i = 0; i < n_dets; i++) {
+    c_shadow[i] = system.coefs[0][i];
+    for (unsigned i_state = 1; i_state < system.n_states; i_state++) {
+      if (std::abs(system.coefs[i_state][i]) > std::abs(c_shadow[i])) {
+        c_shadow[i] = system.coefs[i_state][i];
+      }
+    }
+  }
+  
+  // For new determinants, compute perturbative estimates
+  // Group connections by new determinant for efficiency
+  std::unordered_map<Det, std::vector<const Connection*>, DetHasher> connections_by_det;
+  for (const auto& conn : important_connections) {
+    connections_by_det[conn.new_det].push_back(&conn);
+  }
+  
+  // Get previous variational energy (use HF if first iteration)
+  double E_var_old = system.energy_var.empty() ? system.energy_hf : system.energy_var[0];
+  
+  for (const auto& pair : connections_by_det) {
+    const Det& new_det = pair.first;
+    const std::vector<const Connection*>& conn_ptrs = pair.second;
+    
+    auto it = det_to_index.find(new_det);
+    if (it != det_to_index.end()) {
+      size_t new_idx = it->second;
+      
+      // Compute perturbative estimate for new determinant
+      double numerator = 0.0;
+      for (const Connection* conn : conn_ptrs) {
+        // c_j_old is the coefficient of the old determinant
+        double c_j_old = c_shadow[conn->j];
+        numerator += conn->H_ij * c_j_old;
+      }
+      
+      // Get diagonal element H_aa
+      double H_aa = hamiltonian.matrix.get_diag(new_idx);
+      double denominator = E_var_old - H_aa;
+      
+      if (std::abs(denominator) > 1e-10) {
+        c_shadow[new_idx] = numerator / denominator;
+      }
+    }
+  }
+  
+  // Step 3: Efficiently select top k off-diagonal elements using shadow wavefunction
+  std::priority_queue<OffDiagElement> shadow_heap;
+  
+  // Process all connections
+  for (const auto& conn : important_connections) {
+    auto it = det_to_index.find(conn.new_det);
+    if (it != det_to_index.end()) {
+      size_t i = it->second;
+      size_t j = conn.j;
+      
+      // Calculate importance metric: |c_shadow[i] * H_ij * c_shadow[j]|
+      double metric = std::abs(c_shadow[i] * conn.H_ij * c_shadow[j]);
+      
+      if (metric > 1e-12) {
+        OffDiagElement elem = {i, j, conn.H_ij, metric};
+        
+        if (shadow_heap.size() < static_cast<size_t>(preconditioner_rank_k)) {
+          shadow_heap.push(elem);
+        } else if (metric > shadow_heap.top().magnitude) {
+          shadow_heap.pop();
+          shadow_heap.push(elem);
+        }
+      }
+    }
+  }
+  
+  // Step 4: Replace collected elements with shadow-based selection
+  collected_off_diagonal_elements.clear();
+  collected_off_diagonal_elements.reserve(shadow_heap.size());
+  
+  while (!shadow_heap.empty()) {
+    collected_off_diagonal_elements.push_back(shadow_heap.top());
+    shadow_heap.pop();
+  }
+  
+  // Sort by magnitude (largest first) for optimal preconditioner construction
+  std::sort(collected_off_diagonal_elements.begin(), collected_off_diagonal_elements.end(),
+            [](const OffDiagElement& a, const OffDiagElement& b) {
+              return a.magnitude > b.magnitude;
+            });
+  
+  if (Parallel::is_master() && !collected_off_diagonal_elements.empty()) {
+    printf("Shadow wavefunction: Collected %zu off-diagonal elements for dynamic preconditioner\n", 
+           collected_off_diagonal_elements.size());
+    printf("Largest magnitude: %#.6e, smallest: %#.6e\n",
+           collected_off_diagonal_elements.front().magnitude,
+           collected_off_diagonal_elements.back().magnitude);
   }
 }
