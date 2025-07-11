@@ -13,22 +13,6 @@
 #include "../util.h"
 #include "sparse_matrix.h"
 
-// N-2 electron core structure for same-spin excitation hashing
-struct NMinus2Core {
-  HalfDet core;
-  
-  bool operator==(const NMinus2Core& other) const {
-    return core == other.core;
-  }
-};
-
-// Hash function for N-2 cores
-struct NMinus2CoreHasher {
-  size_t operator()(const NMinus2Core& n2core) const {
-    return n2core.core.get_hash_value();
-  }
-};
-
 template <class S>
 class Hamiltonian {
  public:
@@ -106,7 +90,16 @@ class Hamiltonian {
                                        const std::vector<size_t>& beta_dets,
                                        size_t start_id);
                                        
-  std::vector<NMinus2Core> generate_n_minus_2_cores(const HalfDet& half_det) const;
+  // Batch versions for group-based processing
+  void find_same_spin_excitations_loop_batch(const S& system, 
+                                             const std::vector<size_t>& new_det_indices,
+                                             const std::vector<size_t>& old_det_indices);
+                                             
+  void find_same_spin_excitations_hash_batch(const S& system,
+                                             const std::vector<size_t>& new_det_indices, 
+                                             const std::vector<size_t>& old_det_indices);
+                                       
+  void generate_n_minus_2_cores(const HalfDet& half_det, std::vector<HalfDet>& cores_out) const;
   
   // Timing statistics for benchmarking
   double total_loop_time = 0.0;
@@ -125,6 +118,17 @@ class Hamiltonian {
   size_t auto_tuning_samples = 20;
   size_t dynamic_threshold = 1000;  // Will be updated each iteration
   bool auto_tuning_enabled = true;
+  bool use_reusable_hash_map = true;  // Memory optimization for N-2 hash algorithm
+  
+  // Performance model coefficients
+  double loop_coeff_a = 2.5e-6;   // Loop: time = a * (M_new * M) + b
+  double loop_coeff_b = 0.001;
+  double hash_coeff_a = 8.0e-6;   // Hash: time = a * M + b * M_new + c
+  double hash_coeff_b = 5.0e-6;
+  double hash_coeff_c = 0.015;
+  
+  // Reusable hash map for N-2 core hashing to eliminate allocation overhead
+  std::unordered_map<HalfDet, std::vector<size_t>, HalfDetHasher> reusable_core_map_;
   
   struct CalibrationPoint {
     size_t M_total;      // Total beta determinants
@@ -152,6 +156,7 @@ Hamiltonian<S>::Hamiltonian() {
   samespin_hash_threshold = Config::get<size_t>("samespin_hash_threshold", 1000);
   auto_tuning_samples = Config::get<size_t>("auto_tuning_samples", 20);
   auto_tuning_enabled = Config::get<bool>("auto_tuning_enabled", true);
+  use_reusable_hash_map = Config::get<bool>("use_reusable_hash_map", true);
   dynamic_threshold = samespin_hash_threshold;  // Initialize with static threshold
 }
 
@@ -489,207 +494,126 @@ void Hamiltonian<S>::update_matrix(const S& system) {
   
   auto start_hamiltonian_time = std::chrono::high_resolution_clock::now();
   
+  // Initialize reusable hash map for N-2 core hashing optimization
+  if (use_reusable_hash_map) {
+    reusable_core_map_.clear();
+    // Reserve memory to avoid re-hashes during construction
+    reusable_core_map_.reserve(100000);
+  }
+  
   // Perform auto-tuning calibration at the start of each macro-iteration
   if (auto_tuning_enabled && Parallel::is_master()) {
     perform_auto_tuning_calibration(system);
   }
 
-  fgpl::DistRange<size_t>(0, n_dets).for_each(
-      [&](const size_t det_id) {
-        const auto& det = system.dets[det_id];
-        const bool is_new_det = det_id >= n_dets_prev;
-        if (is_new_det) {
-          const double H = time_sym ? system.get_hamiltonian_elem_time_sym(det, det, 0)
-                                    : system.get_hamiltonian_elem(det, det, 0);
-          matrix.append_elem(det_id, det_id, H);
-        }
-        const size_t start_id = is_new_det ? det_id + 1 : n_dets_prev;
+  // Step 1: Group All Determinants by HalfDet
+  // Map from a HalfDet spin-string to all determinant indices that contain it.
+  std::unordered_map<HalfDet, std::vector<size_t>, HalfDetHasher> det_groups;
+  
+  // Add diagonal elements for new determinants first
+  for (size_t det_id = 0; det_id < n_dets; det_id++) {
+    const auto& det = system.dets[det_id];
+    const bool is_new_det = det_id >= n_dets_prev;
+    if (is_new_det) {
+      const double H = time_sym ? system.get_hamiltonian_elem_time_sym(det, det, 0)
+                                : system.get_hamiltonian_elem(det, det, 0);
+      matrix.append_elem(det_id, det_id, H);
+    }
+    
+    // Group determinants by their alpha half-determinant for same-spin excitations
+    const auto& alpha = det.up;
+    det_groups[alpha].push_back(det_id);
+  }
 
-        // SKIP: Single or double alpha excitations for pure same-spin benchmark
-        // const auto& beta = det.dn;
-        // const size_t beta_id = time_sym ? alpha_to_id[beta] : beta_to_id[beta];
-        // const auto& alpha_dets = beta_id_to_det_ids[beta_id];
-        // for (auto it = alpha_dets.begin(); it != alpha_dets.end(); it++) {
-        //   const size_t alpha_det_id = *it;
-        //   if (alpha_det_id < start_id) continue;
-        //   const auto& connected_det = system.dets[alpha_det_id];
-        //   const double H = time_sym ? system.get_hamiltonian_elem_time_sym(det, connected_det, -1)
-        //                             : system.get_hamiltonian_elem(det, connected_det, -1);
-        //   if (std::abs(H) < Util::EPS) continue;
-        //   matrix.append_elem(det_id, alpha_det_id, H);
-        // }
-        // if (time_sym && alpha_id_to_det_ids.size() > beta_id && det.up != det.dn) {
-        //   const auto& alpha_dets = alpha_id_to_det_ids[beta_id];
-        //   for (auto it = alpha_dets.begin(); it != alpha_dets.end(); it++) {
-        //     const size_t alpha_det_id = *it;
-        //     if (alpha_det_id < start_id) continue;
-        //     const auto& connected_det = system.dets[alpha_det_id];
-        //     if (connected_det.up == connected_det.dn) continue;
-        //     const double H = system.get_hamiltonian_elem_time_sym(det, connected_det, -1);
-        //     if (std::abs(H) < Util::EPS) continue;
-        //     matrix.append_elem(det_id, alpha_det_id, H);
-        //   }
-        // }
+  // Step 2: Create the Main Loop Over HalfDet Groups
+  for (auto const& group_pair : det_groups) {
+    const auto& half_det = group_pair.first;
+    const auto& det_indices = group_pair.second;
+    // Step 3: Implement Per-Group Adaptive Logic
+    
+    // Partition det_indices into new and old determinants
+    std::vector<size_t> new_det_indices;
+    std::vector<size_t> old_det_indices;
+    
+    for (size_t det_id : det_indices) {
+      if (det_id >= n_dets_prev) {
+        new_det_indices.push_back(det_id);
+      } else {
+        old_det_indices.push_back(det_id);
+      }
+    }
+    
+    // If no new determinants in this group, skip
+    if (new_det_indices.empty()) {
+      continue;
+    }
+    
+    // Calculate N and N_new for cost model
+    size_t N = det_indices.size();
+    // size_t N_new = new_det_indices.size();  // unused but kept for future cost model
+    
+    // Per-group timing and algorithm selection tracking
+    auto start_group_time = std::chrono::high_resolution_clock::now();
+    
+    std::string algorithm_chosen;
+    
+    // Apply refined cost model to choose algorithm for this entire group
+    // Cost models: 
+    //   Loop: time = loop_coeff_a * (M_new * M) + loop_coeff_b
+    //   Hash: time = hash_coeff_a * M + hash_coeff_b * M_new + hash_coeff_c
+    size_t M_new = new_det_indices.size();
+    
+    if (auto_tuning_enabled && calibration_data.size() >= 3) {
+      // Use fitted cost models for decision
+      double time_loop = loop_coeff_a * (M_new * N) + loop_coeff_b;
+      double time_hash = hash_coeff_a * N + hash_coeff_b * M_new + hash_coeff_c;
+      
+      if (time_loop <= time_hash) {
+        algorithm_chosen = "Loop";
+        find_same_spin_excitations_loop_batch(system, new_det_indices, old_det_indices);
+        total_loop_calls++;
+      } else {
+        algorithm_chosen = "N-2 Hash";
+        find_same_spin_excitations_hash_batch(system, new_det_indices, old_det_indices);
+        total_hash_calls++;
+      }
+    } else {
+      // Fallback to simple threshold-based decision
+      size_t threshold_to_use = auto_tuning_enabled ? dynamic_threshold : samespin_hash_threshold;
+      if (N < threshold_to_use) {
+        algorithm_chosen = "Loop";
+        find_same_spin_excitations_loop_batch(system, new_det_indices, old_det_indices);
+        total_loop_calls++;
+      } else {
+        algorithm_chosen = "N-2 Hash";
+        find_same_spin_excitations_hash_batch(system, new_det_indices, old_det_indices);
+        total_hash_calls++;
+      }
+    }
+    
+    auto end_group_time = std::chrono::high_resolution_clock::now();
+    double group_time = std::chrono::duration<double>(end_group_time - start_group_time).count();
+    
+    if (algorithm_chosen == "Loop") {
+      total_loop_time += group_time;
+    } else {
+      total_hash_time += group_time;
+    }
+    
+    // Store per-group data for reporting (using first determinant as representative)
+    if (!det_indices.empty()) {
+      size_t representative_det_id = det_indices[0];
+      const auto& representative_det = system.dets[representative_det_id];
+      const auto& alpha = representative_det.up;
+      size_t alpha_id = alpha_to_id[alpha];
+      
+      alpha_group_ids.push_back(alpha_id);
+      alpha_group_beta_counts.push_back(N);
+      alpha_group_algorithms.push_back(algorithm_chosen);
+      alpha_group_times.push_back(group_time * 1000.0); // Convert to ms
+    }
+  }
 
-        // Single or double beta excitations.
-        const auto& alpha = det.up;
-        const size_t alpha_id = alpha_to_id[alpha];
-        const auto& beta_dets = alpha_id_to_det_ids[alpha_id];
-        
-        // Per-alpha-group timing and algorithm selection tracking
-        auto start_alpha_group = std::chrono::high_resolution_clock::now();
-        
-        std::string algorithm_chosen;
-        size_t threshold_to_use = auto_tuning_enabled ? dynamic_threshold : samespin_hash_threshold;
-        if (beta_dets.size() < threshold_to_use) {
-          // Use original 2018 loop algorithm for small lists
-          algorithm_chosen = "Loop";
-          find_same_spin_excitations_loop(system, det_id, beta_dets, start_id);
-          total_loop_calls++;
-        } else {
-          // Use new N-2 core hashing algorithm for large lists
-          algorithm_chosen = "N-2 Hash";
-          find_same_spin_excitations_hash(system, det_id, beta_dets, start_id);
-          total_hash_calls++;
-        }
-        
-        auto end_alpha_group = std::chrono::high_resolution_clock::now();
-        double alpha_group_time = std::chrono::duration<double>(end_alpha_group - start_alpha_group).count();
-        
-        if (algorithm_chosen == "Loop") {
-          total_loop_time += alpha_group_time;
-        } else {
-          total_hash_time += alpha_group_time;
-        }
-        
-        // Store per-alpha-group data for Test Plan B reporting
-        alpha_group_ids.push_back(alpha_id);
-        alpha_group_beta_counts.push_back(beta_dets.size());
-        alpha_group_algorithms.push_back(algorithm_chosen);
-        alpha_group_times.push_back(alpha_group_time * 1000.0); // Convert to ms
-        if (time_sym && beta_id_to_det_ids.size() > alpha_id && det.up != det.dn) {
-          const auto& beta_dets = beta_id_to_det_ids[alpha_id];
-          for (auto it = beta_dets.begin(); it != beta_dets.end(); it++) {
-            const size_t beta_det_id = *it;
-            if (beta_det_id < start_id) continue;
-            const auto& connected_det = system.dets[beta_det_id];
-            if (connected_det.up == connected_det.dn) continue;
-            const double H = system.get_hamiltonian_elem_time_sym(det, connected_det, -1);
-            if (std::abs(H) < Util::EPS) continue;
-            matrix.append_elem(det_id, beta_det_id, H);
-          }
-        }
-
-        // SKIP: Mixed double excitation for pure same-spin benchmark
-        // if (!system.has_double_excitation && !system.time_sym) return;
-        // const auto& alpha_singles = alpha_id_to_single_ids[alpha_id];
-        // const auto& beta_singles =
-        //     time_sym ? alpha_id_to_single_ids[beta_id] : beta_id_to_single_ids[beta_id];
-        // for (const auto alpha_single : alpha_singles) {
-        //   if (alpha_id_to_beta_ids.size() <= alpha_single) continue;
-        //   if (time_sym && alpha_single == beta_id) continue;
-        //   const auto& related_beta_ids = alpha_id_to_beta_ids[alpha_single];
-        //   const auto& related_det_ids = alpha_id_to_det_ids[alpha_single];
-        //   const size_t n_related_dets = related_beta_ids.size();
-        //   if (sort_by_det_id) {
-        //     const auto& start_ptr =
-        //         std::lower_bound(related_det_ids.begin(), related_det_ids.end(), start_id);
-        //     const size_t start_related_id = start_ptr - related_det_ids.begin();
-        //     for (size_t related_id = start_related_id; related_id < n_related_dets; related_id++) {
-        //       const size_t related_beta = related_beta_ids[related_id];
-        //       if (time_sym && related_beta == alpha_id) continue;
-        //       if (std::binary_search(beta_singles.begin(), beta_singles.end(), related_beta)) {
-        //         const size_t related_det_id = related_det_ids[related_id];
-        //         const auto& connected_det = system.dets[related_det_id];
-        //         const double H = time_sym
-        //                              ? system.get_hamiltonian_elem_time_sym(det, connected_det, 2)
-        //                              : system.get_hamiltonian_elem(det, connected_det, 2);
-        //         if (std::abs(H) < Util::EPS) continue;
-        //         matrix.append_elem(det_id, related_det_id, H);
-        //       }
-        //     }
-        //   } else {
-        //     size_t ptr = 0;
-        //     for (auto it = beta_singles.begin(); it != beta_singles.end(); it++) {
-        //       const size_t beta_single = *it;
-        //       if (time_sym && beta_single == alpha_id) continue;
-        //       while (ptr < n_related_dets && related_beta_ids[ptr] < beta_single) {
-        //         ptr++;
-        //       }
-        //       if (ptr == n_related_dets) break;
-        //       if (related_beta_ids[ptr] == beta_single) {
-        //         const size_t related_det_id = related_det_ids[ptr];
-        //         ptr++;
-        //         if (related_det_id < start_id) continue;
-        //         const auto& connected_det = system.dets[related_det_id];
-        //         const double H = time_sym
-        //                              ? system.get_hamiltonian_elem_time_sym(det, connected_det, 2)
-        //                              : system.get_hamiltonian_elem(det, connected_det, 2);
-        //         if (std::abs(H) < Util::EPS) continue;
-        //         matrix.append_elem(det_id, related_det_id, H);
-        //       }
-        //     }
-        //   }  // sort by det
-        // }
-        // if (time_sym && det.up != det.dn) {
-        //   Det det_rev = det;
-        //   det_rev.reverse_spin();
-        //   for (const auto alpha_single : alpha_singles) {
-        //     if (alpha_single == beta_id) continue;
-        //     if (beta_id_to_alpha_ids.size() <= alpha_single) continue;
-        //     const auto& related_beta_ids = beta_id_to_alpha_ids[alpha_single];
-        //     const auto& related_det_ids = beta_id_to_det_ids[alpha_single];
-        //     const size_t n_related_dets = related_beta_ids.size();
-        //     if (sort_by_det_id) {
-        //       const auto& start_ptr =
-        //           std::lower_bound(related_det_ids.begin(), related_det_ids.end(), start_id);
-        //       const size_t start_related_id = start_ptr - related_det_ids.begin();
-        //       for (size_t related_id = start_related_id; related_id < n_related_dets;
-        //            related_id++) {
-        //         const size_t related_beta = related_beta_ids[related_id];
-        //         if (related_beta == alpha_id) continue;
-        //         const size_t related_det_id = related_det_ids[related_id];
-        //         const auto& connected_det = system.dets[related_det_id];
-        //         if (connected_det.up == connected_det.dn) continue;
-        //         if (connected_det.up.diff(det.up).n_diffs == 1 &&
-        //             connected_det.dn.diff(det.dn).n_diffs == 1) {
-        //           continue;
-        //         }
-        //         if (std::binary_search(beta_singles.begin(), beta_singles.end(), related_beta)) {
-        //           const double H = system.get_hamiltonian_elem_time_sym(det_rev, connected_det, 2);
-        //           if (std::abs(H) < Util::EPS) continue;
-        //           matrix.append_elem(det_id, related_det_id, H);
-        //         }
-        //       }
-        //     } else {
-        //       size_t ptr = 0;
-        //       for (auto it = beta_singles.begin(); it != beta_singles.end(); it++) {
-        //         const size_t beta_single = *it;
-        //         if (beta_single == alpha_id) continue;
-        //         while (ptr < n_related_dets && related_beta_ids[ptr] < beta_single) {
-        //           ptr++;
-        //         }
-        //         if (ptr == n_related_dets) break;
-        //         if (related_beta_ids[ptr] == beta_single) {
-        //           const size_t related_det_id = related_det_ids[ptr];
-        //           ptr++;
-        //           if (related_det_id < start_id) continue;
-        //           const auto& connected_det = system.dets[related_det_id];
-        //           if (connected_det.up == connected_det.dn) continue;
-        //           if (connected_det.up.diff(det.up).n_diffs == 1 &&
-        //               connected_det.dn.diff(det.dn).n_diffs == 1) {
-        //             continue;
-        //           }
-        //           const double H = system.get_hamiltonian_elem_time_sym(det_rev, connected_det, 2);
-        //           if (std::abs(H) < Util::EPS) continue;
-        //           matrix.append_elem(det_id, related_det_id, H);
-        //         }
-        //       }
-        //     }  // sort by det
-        //   }  // alpha single
-        // }  // time sym
-      },
-      Parallel::is_master());
 
   const size_t n_elems = matrix.count_n_elems();
   if (Parallel::is_master()) {
@@ -790,8 +714,16 @@ void Hamiltonian<S>::find_same_spin_excitations_hash(const S& system, size_t det
     printf("  Min beta_dets: %zu, Min n2_pairs: %zu\n", min_beta_dets, min_n2_cores);
   }
   
-  // Build Phase: Create hash map of N-2 cores to determinant indices
-  std::unordered_map<NMinus2Core, std::vector<size_t>, NMinus2CoreHasher> core_map;
+  // Single reusable vector for core generation to avoid repeated allocations
+  std::vector<HalfDet> generated_cores;
+  generated_cores.reserve(n2_pairs);
+  
+  // Track keys added during this call for selective cleanup (not used in local approach)
+  // std::vector<HalfDet> keys_added_this_call;
+  
+  // Always use local hash map approach for thread safety
+  // Fallback to original local hash map approach
+  std::unordered_map<HalfDet, std::vector<size_t>, HalfDetHasher> local_core_map;
   
   for (auto it = beta_dets.begin(); it != beta_dets.end(); it++) {
     const size_t beta_det_id = *it;
@@ -800,19 +732,19 @@ void Hamiltonian<S>::find_same_spin_excitations_hash(const S& system, size_t det
     const auto& beta_det = system.dets[beta_det_id];
     
     // Generate all N-2 cores for this beta determinant  
-    auto n2_cores = generate_n_minus_2_cores(beta_det.dn);
-    for (const auto& core : n2_cores) {
-      core_map[core].push_back(beta_det_id);
+    generate_n_minus_2_cores(beta_det.dn, generated_cores);
+    for (const auto& core : generated_cores) {
+      local_core_map[core].push_back(beta_det_id);
     }
   }
   
   // Query Phase: Find connections for the current determinant
-  auto current_n2_cores = generate_n_minus_2_cores(det.dn);
+  generate_n_minus_2_cores(det.dn, generated_cores);
   std::set<size_t> visited_pairs;  // Avoid duplicates from multiple cores
   
-  for (const auto& core : current_n2_cores) {
-    auto it = core_map.find(core);
-    if (it != core_map.end()) {
+  for (const auto& core : generated_cores) {
+    auto it = local_core_map.find(core);
+    if (it != local_core_map.end()) {
       for (size_t connected_det_id : it->second) {
         if (visited_pairs.find(connected_det_id) != visited_pairs.end()) continue;
         visited_pairs.insert(connected_det_id);
@@ -829,22 +761,138 @@ void Hamiltonian<S>::find_same_spin_excitations_hash(const S& system, size_t det
 
 // Generate all N-2 electron cores from a half-determinant
 template <class S>
-std::vector<NMinus2Core> Hamiltonian<S>::generate_n_minus_2_cores(const HalfDet& half_det) const {
-  std::vector<NMinus2Core> cores;
+void Hamiltonian<S>::generate_n_minus_2_cores(const HalfDet& half_det, std::vector<HalfDet>& cores_out) const {
+  cores_out.clear();
   auto occupied_orbs = half_det.get_occupied_orbs();
   
   // Generate all combinations of removing 2 electrons from N occupied orbitals
   for (size_t i = 0; i < occupied_orbs.size(); i++) {
     for (size_t j = i + 1; j < occupied_orbs.size(); j++) {
-      NMinus2Core core;
-      core.core = half_det;
-      core.core.unset(occupied_orbs[i]);
-      core.core.unset(occupied_orbs[j]);
-      cores.push_back(core);
+      HalfDet core = half_det;
+      core.unset(occupied_orbs[i]);
+      core.unset(occupied_orbs[j]);
+      cores_out.push_back(core);
+    }
+  }
+}
+
+// Batch loop algorithm for group-based processing
+template <class S>
+void Hamiltonian<S>::find_same_spin_excitations_loop_batch(const S& system, 
+                                                           const std::vector<size_t>& new_det_indices,
+                                                           const std::vector<size_t>& old_det_indices) {
+  // Step 4: Execute the Loop Algorithm on the Entire Batch
+  // Simple O(N*N_new) nested loop over new determinants vs all determinants in group
+  for (size_t new_det_id : new_det_indices) {
+    const auto& new_det = system.dets[new_det_id];
+    
+    // Check connections to all other determinants in the group
+    for (size_t other_det_id : old_det_indices) {
+      if (other_det_id >= new_det_id) continue; // Avoid double counting
+      
+      const auto& other_det = system.dets[other_det_id];
+      const double H = time_sym ? system.get_hamiltonian_elem_time_sym(new_det, other_det, -1)
+                                : system.get_hamiltonian_elem(new_det, other_det, -1);
+      if (std::abs(H) < Util::EPS) continue;
+      matrix.append_elem(new_det_id, other_det_id, H);
+    }
+    
+    // Check connections to other new determinants (upper triangle only)
+    for (size_t other_new_det_id : new_det_indices) {
+      if (other_new_det_id <= new_det_id) continue; // Avoid double counting and self
+      
+      const auto& other_det = system.dets[other_new_det_id];
+      const double H = time_sym ? system.get_hamiltonian_elem_time_sym(new_det, other_det, -1)
+                                : system.get_hamiltonian_elem(new_det, other_det, -1);
+      if (std::abs(H) < Util::EPS) continue;
+      matrix.append_elem(new_det_id, other_new_det_id, H);
+    }
+  }
+}
+
+// Batch hash algorithm for group-based processing  
+template <class S>
+void Hamiltonian<S>::find_same_spin_excitations_hash_batch(const S& system,
+                                                           const std::vector<size_t>& new_det_indices, 
+                                                           const std::vector<size_t>& old_det_indices) {
+  // Step 4: Execute the Hash Algorithm on the Entire Batch
+  // Build hash table once using old determinants, probe with all new determinants
+  
+  std::vector<HalfDet> generated_cores;
+  
+  // Build Phase: Create hash table from old determinants
+  std::unordered_map<HalfDet, std::vector<size_t>, HalfDetHasher> local_core_map;
+  
+  for (size_t old_det_id : old_det_indices) {
+    const auto& old_det = system.dets[old_det_id];
+    
+    generate_n_minus_2_cores(old_det.dn, generated_cores);
+    for (const auto& core : generated_cores) {
+      local_core_map[core].push_back(old_det_id);
     }
   }
   
-  return cores;
+  // Query Phase: Find connections for all new determinants
+  for (size_t new_det_id : new_det_indices) {
+    const auto& new_det = system.dets[new_det_id];
+    
+    generate_n_minus_2_cores(new_det.dn, generated_cores);
+    std::set<size_t> visited_pairs;  // Avoid duplicates from multiple cores
+    
+    for (const auto& core : generated_cores) {
+      auto it = local_core_map.find(core);
+      if (it != local_core_map.end()) {
+        for (size_t connected_det_id : it->second) {
+          if (visited_pairs.find(connected_det_id) != visited_pairs.end()) continue;
+          visited_pairs.insert(connected_det_id);
+          
+          const auto& connected_det = system.dets[connected_det_id];
+          const double H = time_sym ? system.get_hamiltonian_elem_time_sym(new_det, connected_det, -1)
+                                    : system.get_hamiltonian_elem(new_det, connected_det, -1);
+          if (std::abs(H) < Util::EPS) continue;
+          matrix.append_elem(new_det_id, connected_det_id, H);
+        }
+      }
+    }
+  }
+  
+  // Handle new-to-new connections using hash approach
+  // Build hash table from new determinants
+  std::unordered_map<HalfDet, std::vector<size_t>, HalfDetHasher> new_core_map;
+  
+  for (size_t new_det_id : new_det_indices) {
+    const auto& new_det = system.dets[new_det_id];
+    
+    generate_n_minus_2_cores(new_det.dn, generated_cores);
+    for (const auto& core : generated_cores) {
+      new_core_map[core].push_back(new_det_id);
+    }
+  }
+  
+  // Query for new-to-new connections (avoid double counting)
+  for (size_t new_det_id : new_det_indices) {
+    const auto& new_det = system.dets[new_det_id];
+    
+    generate_n_minus_2_cores(new_det.dn, generated_cores);
+    std::set<size_t> visited_pairs;
+    
+    for (const auto& core : generated_cores) {
+      auto it = new_core_map.find(core);
+      if (it != new_core_map.end()) {
+        for (size_t connected_det_id : it->second) {
+          if (connected_det_id <= new_det_id) continue; // Avoid double counting and self
+          if (visited_pairs.find(connected_det_id) != visited_pairs.end()) continue;
+          visited_pairs.insert(connected_det_id);
+          
+          const auto& connected_det = system.dets[connected_det_id];
+          const double H = time_sym ? system.get_hamiltonian_elem_time_sym(new_det, connected_det, -1)
+                                    : system.get_hamiltonian_elem(new_det, connected_det, -1);
+          if (std::abs(H) < Util::EPS) continue;
+          matrix.append_elem(new_det_id, connected_det_id, H);
+        }
+      }
+    }
+  }
 }
 
 // Print timing summary for benchmarking
@@ -1038,21 +1086,28 @@ double Hamiltonian<S>::time_algorithm_for_calibration(const S& system, size_t al
   
   if (use_hash) {
     // Time hash algorithm (without adding to matrix)
-    // Generate N-2 cores and perform lookups
-    auto cores = generate_n_minus_2_cores(det.dn);
+    // Single reusable vector for core generation
+    std::vector<HalfDet> generated_cores;
+    size_t n_electrons = det.dn.get_occupied_orbs().size();
+    size_t n2_pairs = (n_electrons * (n_electrons - 1)) / 2;
+    generated_cores.reserve(n2_pairs);
+    
+    // Generate N-2 cores for current determinant
+    generate_n_minus_2_cores(det.dn, generated_cores);
     
     // Create temporary hash table for timing
-    std::unordered_map<NMinus2Core, std::vector<size_t>, NMinus2CoreHasher> core_to_indices;
+    std::unordered_map<HalfDet, std::vector<size_t>, HalfDetHasher> core_to_indices;
     for (size_t i = 0; i < beta_dets.size(); i++) {
       const auto& beta_det = system.dets[beta_dets[i]];
-      auto beta_cores = generate_n_minus_2_cores(beta_det.dn);
-      for (const auto& core : beta_cores) {
+      generate_n_minus_2_cores(beta_det.dn, generated_cores);
+      for (const auto& core : generated_cores) {
         core_to_indices[core].push_back(i);
       }
     }
     
     // Perform lookups
-    for (const auto& core : cores) {
+    generate_n_minus_2_cores(det.dn, generated_cores);
+    for (const auto& core : generated_cores) {
       auto it = core_to_indices.find(core);
       if (it != core_to_indices.end()) {
         // Process matches (timing only)
@@ -1086,8 +1141,8 @@ void Hamiltonian<S>::fit_performance_models_and_calculate_threshold() {
   }
   
   // Perform multiple linear regression for both algorithms
-  // Model: time_loop(M, M_new) = a * (M_new * M) + b
-  // Model: time_hash(M, M_new) = c * (M_old + M_new) + d
+  // Model: time_loop(M, M_new) = a1 * (M_new * M) + b1
+  // Model: time_hash(M, M_new) = a2 * M + b2 * M_new + c2 (build + probe + setup)
   
   size_t n = calibration_data.size();
   
@@ -1102,26 +1157,64 @@ void Hamiltonian<S>::fit_performance_models_and_calculate_threshold() {
     sum_xy_loop += x * y;
   }
   
-  double a = (n * sum_xy_loop - sum_x_loop * sum_y_loop) / (n * sum_xx_loop - sum_x_loop * sum_x_loop);
-  double b = (sum_y_loop - a * sum_x_loop) / n;
+  loop_coeff_a = (n * sum_xy_loop - sum_x_loop * sum_y_loop) / (n * sum_xx_loop - sum_x_loop * sum_x_loop);
+  loop_coeff_b = (sum_y_loop - loop_coeff_a * sum_x_loop) / n;
   
-  // Calculate regression coefficients for hash algorithm: time = c * (M + M_new) + d
-  double sum_x_hash = 0, sum_y_hash = 0, sum_xx_hash = 0, sum_xy_hash = 0;
+  // Calculate regression coefficients for hash algorithm: time = a2 * M + b2 * M_new + c2
+  // Using multiple linear regression with three parameters
+  double sum_m = 0, sum_m_new = 0, sum_y_hash = 0;
+  double sum_mm = 0, sum_m_new_m_new = 0, sum_m_m_new = 0;
+  double sum_m_y = 0, sum_m_new_y = 0;
+  
   for (const auto& point : calibration_data) {
-    double x = static_cast<double>(point.M_total + point.M_new);  // M + M_new
+    double m = static_cast<double>(point.M_total);
+    double m_new = static_cast<double>(point.M_new);
     double y = point.time_hash;
-    sum_x_hash += x;
+    
+    sum_m += m;
+    sum_m_new += m_new;
     sum_y_hash += y;
-    sum_xx_hash += x * x;
-    sum_xy_hash += x * y;
+    sum_mm += m * m;
+    sum_m_new_m_new += m_new * m_new;
+    sum_m_m_new += m * m_new;
+    sum_m_y += m * y;
+    sum_m_new_y += m_new * y;
   }
   
-  double c = (n * sum_xy_hash - sum_x_hash * sum_y_hash) / (n * sum_xx_hash - sum_x_hash * sum_x_hash);
-  double d = (sum_y_hash - c * sum_x_hash) / n;
+  // Solve the normal equations for multiple linear regression
+  // [sum_mm       sum_m_m_new  sum_m    ] [a2]   [sum_m_y    ]
+  // [sum_m_m_new  sum_m_new^2  sum_m_new] [b2] = [sum_m_new_y]
+  // [sum_m        sum_m_new    n        ] [c2]   [sum_y_hash ]
+  
+  double det = n * (sum_mm * sum_m_new_m_new - sum_m_m_new * sum_m_m_new) -
+               sum_m * (sum_m * sum_m_new_m_new - sum_m_new * sum_m_m_new) +
+               sum_m_new * (sum_m * sum_m_m_new - sum_mm * sum_m_new);
+  
+  if (std::abs(det) > 1e-12) {
+    hash_coeff_a = (n * (sum_m_y * sum_m_new_m_new - sum_m_new_y * sum_m_m_new) -
+                    sum_m_new * (sum_m * sum_m_new_y - sum_y_hash * sum_m_m_new) +
+                    sum_y_hash * (sum_m * sum_m_new_m_new - sum_m_new * sum_m_m_new)) / det;
+                    
+    hash_coeff_b = (sum_mm * (n * sum_m_new_y - sum_m_new * sum_y_hash) -
+                    sum_m * (sum_m * sum_m_new_y - sum_y_hash * sum_m_m_new) +
+                    sum_y_hash * (sum_m * sum_m_new - sum_mm * sum_m_new)) / det;
+                    
+    hash_coeff_c = (sum_mm * (sum_m_new_m_new * sum_y_hash - sum_m_new * sum_m_new_y) -
+                    sum_m_m_new * (sum_m_m_new * sum_y_hash - sum_m * sum_m_new_y) +
+                    sum_m_y * (sum_m_m_new * sum_m_new - sum_mm * sum_m_new)) / det;
+  } else {
+    // Fallback to simple linear regression if matrix is singular
+    printf("Warning: Singular matrix in hash regression, using fallback\n");
+    double sum_x_hash = sum_m + sum_m_new;
+    double sum_xx_hash = sum_mm + 2*sum_m_m_new + sum_m_new_m_new;
+    double sum_xy_hash = sum_m_y + sum_m_new_y;
+    hash_coeff_a = hash_coeff_b = (n * sum_xy_hash - sum_x_hash * sum_y_hash) / (n * sum_xx_hash - sum_x_hash * sum_x_hash);
+    hash_coeff_c = (sum_y_hash - (hash_coeff_a + hash_coeff_b) * sum_x_hash) / n;
+  }
   
   printf("Performance models fitted:\n");
-  printf("  Loop: time = %.6f * (M_new * M) + %.6f\n", a, b);
-  printf("  Hash: time = %.6f * (M + M_new) + %.6f\n", c, d);
+  printf("  Loop: time = %.6f * (M_new * M) + %.6f\n", loop_coeff_a, loop_coeff_b);
+  printf("  Hash: time = %.6f * M + %.6f * M_new + %.6f\n", hash_coeff_a, hash_coeff_b, hash_coeff_c);
   
   // Find crossover threshold where both algorithms have equal time
   // For each calibration point, calculate what M would give equal times
@@ -1130,13 +1223,13 @@ void Hamiltonian<S>::fit_performance_models_and_calculate_threshold() {
   
   for (const auto& point : calibration_data) {
     // For this specific M_new, find M where:
-    // a * (M_new * M) + b = c * (M + M_new) + d
-    // a * M_new * M + b = c * M + c * M_new + d
-    // a * M_new * M - c * M = c * M_new + d - b
-    // M * (a * M_new - c) = c * M_new + d - b
+    // loop_coeff_a * (M_new * M) + loop_coeff_b = hash_coeff_a * M + hash_coeff_b * M_new + hash_coeff_c
+    // loop_coeff_a * M_new * M + loop_coeff_b = hash_coeff_a * M + hash_coeff_b * M_new + hash_coeff_c
+    // loop_coeff_a * M_new * M - hash_coeff_a * M = hash_coeff_b * M_new + hash_coeff_c - loop_coeff_b
+    // M * (loop_coeff_a * M_new - hash_coeff_a) = hash_coeff_b * M_new + hash_coeff_c - loop_coeff_b
     
-    double coeff = a * point.M_new - c;
-    double rhs = c * point.M_new + d - b;
+    double coeff = loop_coeff_a * point.M_new - hash_coeff_a;
+    double rhs = hash_coeff_b * point.M_new + hash_coeff_c - loop_coeff_b;
     
     if (std::abs(coeff) > 1e-12) {
       double crossover_M = rhs / coeff;
