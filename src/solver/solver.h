@@ -1486,24 +1486,52 @@ std::vector<double> Solver<S>::generate_automated_epsilon_schedule(const double 
   // Calculate eps0 as minimum of the two maximum values
   const double eps0 = std::min(max_H_same, max_H_opp);
   
-  // Calculate intermediate epsilon as geometric mean
-  const double eps_intermediate = std::sqrt(eps0 * eps_final);
+  // Get the epsilon schedule algorithm from config
+  const std::string schedule_algorithm = Config::get<std::string>("epsilon_schedule_algorithm", "geometric_mean");
   
-  if (Parallel::is_master()) {
-    printf("Automated schedule: eps0 = %#.2e (max_H_same = %#.2e, max_H_opp = %#.2e)\n", 
-           eps0, max_H_same, max_H_opp);
-    printf("                    eps_intermediate = %#.2e\n", eps_intermediate);
-    printf("                    eps_final = %#.2e\n", eps_final);
-  }
-  
-  // Create the three-stage schedule
   std::vector<double> schedule;
   
-  // Only add intermediate stage if it's meaningfully different from endpoints
-  if (eps_intermediate > eps_final * 2.0 && eps_intermediate < eps0 * 0.5) {
-    schedule = {eps0, eps_intermediate};
+  if (schedule_algorithm == "geometric_mean") {
+    // Original algorithm: use geometric mean for intermediate value
+    const double eps_intermediate = std::sqrt(eps0 * eps_final);
+    
+    if (Parallel::is_master()) {
+      printf("Automated schedule (geometric_mean): eps0 = %#.2e (max_H_same = %#.2e, max_H_opp = %#.2e)\n", 
+             eps0, max_H_same, max_H_opp);
+      printf("                                     eps_intermediate = %#.2e\n", eps_intermediate);
+      printf("                                     eps_final = %#.2e\n", eps_final);
+    }
+    
+    // Only add intermediate stage if it's meaningfully different from endpoints
+    if (eps_intermediate > eps_final * 2.0 && eps_intermediate < eps0 * 0.5) {
+      schedule = {eps0, eps_intermediate};
+    } else {
+      schedule = {eps0};
+    }
+  } else if (schedule_algorithm == "divide_by_2") {
+    // New algorithm: divide by 2 each iteration until reaching target
+    double current_eps = eps0;
+    schedule.push_back(current_eps);
+    
+    while (current_eps > eps_final * 2.0) {
+      current_eps /= 2.0;
+      if (current_eps >= eps_final) {
+        schedule.push_back(current_eps);
+      }
+    }
+    
+    if (Parallel::is_master()) {
+      printf("Automated schedule (divide_by_2): eps0 = %#.2e (max_H_same = %#.2e, max_H_opp = %#.2e)\n", 
+             eps0, max_H_same, max_H_opp);
+      printf("                                  intermediate values: ");
+      for (size_t i = 1; i < schedule.size(); ++i) {
+        printf("%#.2e ", schedule[i]);
+      }
+      printf("\n                                  eps_final = %#.2e\n", eps_final);
+    }
   } else {
-    schedule = {eps0};
+    throw std::invalid_argument("Invalid epsilon_schedule_algorithm: " + schedule_algorithm + 
+                                ". Valid options are: geometric_mean, divide_by_2");
   }
   
   return schedule;
