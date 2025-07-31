@@ -10,7 +10,7 @@ Arrow is a selected configuration interaction plus perturbation theory (SCI+PT) 
 Instructions for installing and running Arrow are documented in the [wiki](https://github.com/QMC-Cornell/shci/wiki).
 
 ## How to Contribute
-Arrow is a research program rather than a fully tested catch-all software package. The efficiency and correctness of edge cases, or input values that differ greatly from the default or published values, are not guaranteed. We welcome help with extending the capabilities of Arrow. If interested, please contact Cyrus Umrigar <CyrusUmrigar@cornell.edu>, or a member of his research group.
+Arrow is a research program rather than a fully tested catch-all software package. The efficiency and correctness of edge cases, or input values that differ greatly from the default or published values, are not guaranteed. We welcome help with extending the capabilities of Arrow. If interested, please contact Adam Holmes <adamaholmes@gmail.com> or Cyrus Umrigar <CyrusUmrigar@cornell.edu>.
 
 ## History and Authorship
 The Heat-Bath Configuration Interaction (HCI) method was conceived, implemented, and first described by **Adam A. Holmes** while he was a student in the **Umrigar** group at Cornell. The subsequent semistochastic variant (SHCI) was developed through a collaborative effort with **Sandeep Sharma** and **Ali Alavi** at the University of Colorado and the Max Planck Institute. Since then the development of SHCI has been a joint effort between the Umrigar group and the Sharma group, where Holmes was a postdoc.
