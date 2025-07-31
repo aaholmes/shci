@@ -13,6 +13,23 @@
 #include "../util.h"
 #include "sparse_matrix.h"
 
+// Data structure for new opposite-spin algorithm
+struct HamiltonianSetupData {
+  // Up-spin structures
+  std::vector<HalfDet> unique_up_dets;
+  std::unordered_map<HalfDet, std::vector<size_t>, HalfDetHasher> up_to_full_map;
+  std::unordered_map<size_t, std::vector<size_t>> upSingles;  // idx -> connected indices
+  
+  // Down-spin structures  
+  std::vector<HalfDet> unique_dn_dets;
+  std::unordered_map<HalfDet, std::vector<size_t>, HalfDetHasher> dn_to_full_map;
+  std::unordered_map<size_t, std::vector<size_t>> dnSingles;
+  
+  // Additional helper structures
+  std::unordered_map<HalfDet, size_t, HalfDetHasher> up_det_to_idx;
+  std::unordered_map<HalfDet, size_t, HalfDetHasher> dn_det_to_idx;
+};
+
 template <class S>
 class Hamiltonian {
  public:
@@ -101,12 +118,75 @@ class Hamiltonian {
                                        
   void generate_n_minus_2_cores(const HalfDet& half_det, std::vector<HalfDet>& cores_out) const;
   
+  // New opposite-spin algorithms
+  HamiltonianSetupData setup_variational_hamiltonian(const std::vector<Det>& variational_space);
+  
+  void find_opposite_spin_excitations_2018(const S& system);
+  
+  void find_opposite_spin_excitations_new(const S& system, 
+                                          const HamiltonianSetupData& setup_data);
+  
+  // Sub-algorithms for new opposite-spin method
+  void opposite_spin_subalg1(const S& system,
+                            const HamiltonianSetupData& setup_data,
+                            size_t up_idx,
+                            const std::vector<size_t>& dn_indices_i,
+                            const std::vector<size_t>& up_singles);
+                            
+  void opposite_spin_subalg2(const S& system,
+                            const HamiltonianSetupData& setup_data,
+                            size_t up_idx,
+                            const std::vector<size_t>& dn_indices_i,
+                            const std::vector<size_t>& up_singles);
+                            
+  void opposite_spin_subalg3(const S& system,
+                            const HamiltonianSetupData& setup_data,
+                            size_t up_idx,
+                            const std::vector<size_t>& dn_indices_i,
+                            const std::vector<size_t>& up_singles);
+  
+  // Cost estimation functions
+  double estimate_opposite_spin_subalg1_cost(size_t n_dn_i, size_t n_up_singles, 
+                                            size_t avg_dn_singles, size_t avg_dn_j) const;
+  double estimate_opposite_spin_subalg2_cost(size_t n_dn_i, size_t n_up_singles, 
+                                            size_t avg_dn_j, size_t n_electrons) const;
+  double estimate_opposite_spin_subalg3_cost(size_t n_dn_i, size_t n_up_singles, 
+                                            size_t avg_dn_j) const;
+  
+  // Helper functions for new algorithms
+  std::vector<HalfDet> generate_n_minus_1_configs(const HalfDet& half_det) const;
+  bool is_single_excitation(const HalfDet& det1, const HalfDet& det2) const;
+  
   // Timing statistics for benchmarking
+  double total_hamiltonian_time = 0.0;
+  
+  // Same-spin timing (detailed breakdown)
+  double total_same_spin_time = 0.0;
+  double total_same_spin_2018_time = 0.0;
+  double total_same_spin_n2_time = 0.0;
+  double total_same_spin_adaptive_time = 0.0;
+  size_t total_same_spin_2018_calls = 0;
+  size_t total_same_spin_n2_calls = 0;
+  size_t total_same_spin_adaptive_calls = 0;
+  
+  // Opposite-spin timing (detailed breakdown)
+  double total_opposite_spin_time = 0.0;
+  double total_opposite_spin_2018_time = 0.0;
+  double total_opposite_spin_new_time = 0.0;
+  double total_opposite_spin_subalg1_time = 0.0;
+  double total_opposite_spin_subalg2_time = 0.0;
+  double total_opposite_spin_subalg3_time = 0.0;
+  size_t total_opposite_spin_2018_calls = 0;
+  size_t total_opposite_spin_new_calls = 0;
+  size_t total_opposite_spin_subalg1_calls = 0;
+  size_t total_opposite_spin_subalg2_calls = 0;
+  size_t total_opposite_spin_subalg3_calls = 0;
+  
+  // Legacy compatibility (maps to adaptive algorithm)
   double total_loop_time = 0.0;
   double total_hash_time = 0.0;
   size_t total_loop_calls = 0;
   size_t total_hash_calls = 0;
-  double total_hamiltonian_time = 0.0;
   
   // Per-alpha-group timing data for Test Plan B
   std::vector<size_t> alpha_group_ids;
@@ -119,6 +199,12 @@ class Hamiltonian {
   size_t dynamic_threshold = 1000;  // Will be updated each iteration
   bool auto_tuning_enabled = true;
   bool use_reusable_hash_map = true;  // Memory optimization for N-2 hash algorithm
+  
+  // Algorithm selection parameters
+  std::string same_spin_algorithm = "adaptive";  // "2018", "n2", "adaptive"
+  std::string opposite_spin_algorithm = "2018";  // "2018", "new"
+  std::string opposite_spin_cost_model = "auto"; // "auto", "subalg1", "subalg2", "subalg3"
+  bool opposite_spin_debug_output = false;
   
   // Performance model coefficients
   double loop_coeff_a = 2.5e-6;   // Loop: time = a * (M_new * M) + b
@@ -158,6 +244,12 @@ Hamiltonian<S>::Hamiltonian() {
   auto_tuning_enabled = Config::get<bool>("auto_tuning_enabled", true);
   use_reusable_hash_map = Config::get<bool>("use_reusable_hash_map", true);
   dynamic_threshold = samespin_hash_threshold;  // Initialize with static threshold
+  
+  // Algorithm selection configuration
+  same_spin_algorithm = Config::get<std::string>("same_spin_algorithm", "adaptive");
+  opposite_spin_algorithm = Config::get<std::string>("opposite_spin_algorithm", "2018");
+  opposite_spin_cost_model = Config::get<std::string>("opposite_spin_cost_model", "auto");
+  opposite_spin_debug_output = Config::get<bool>("opposite_spin_debug_output", false);
 }
 
 template <class S>
@@ -614,6 +706,24 @@ void Hamiltonian<S>::update_matrix(const S& system) {
     }
   }
 
+  // Handle opposite-spin excitations based on selected algorithm
+  auto opposite_spin_start_time = std::chrono::high_resolution_clock::now();
+  
+  if (opposite_spin_algorithm == "new") {
+    // Use new algorithm with 3 sub-algorithms
+    HamiltonianSetupData setup_data = setup_variational_hamiltonian(system.dets);
+    find_opposite_spin_excitations_new(system, setup_data);
+  } else {
+    // Use 2018 algorithm (default)
+    find_opposite_spin_excitations_2018(system);
+  }
+  
+  auto opposite_spin_end_time = std::chrono::high_resolution_clock::now();
+  double opposite_spin_time = std::chrono::duration<double>(opposite_spin_end_time - opposite_spin_start_time).count();
+  
+  if (Parallel::is_master() && opposite_spin_debug_output) {
+    printf("Opposite-spin processing complete: %.3fs\n", opposite_spin_time);
+  }
 
   const size_t n_elems = matrix.count_n_elems();
   if (Parallel::is_master()) {
@@ -901,22 +1011,79 @@ void Hamiltonian<S>::print_timing_summary() const {
   if (Parallel::is_master()) {
     printf("\n========== HAMILTONIAN TIMING SUMMARY ==========\n");
     printf("Total Hamiltonian construction time: %.6f seconds\n", total_hamiltonian_time);
+    
+    // Same-spin timing breakdown
+    double computed_same_spin_time = total_same_spin_2018_time + total_same_spin_n2_time + total_loop_time + total_hash_time;
+    
     printf("\nSame-spin excitation timing breakdown:\n");
-    printf("  Loop algorithm (2018 baseline):\n");
-    printf("    Total calls: %zu\n", total_loop_calls);
-    printf("    Total time: %.6f seconds\n", total_loop_time);
-    if (total_loop_calls > 0) {
-      printf("    Average time per call: %.9f seconds\n", total_loop_time / total_loop_calls);
+    if (total_same_spin_2018_calls > 0) {
+      printf("  2018 Algorithm:\n");
+      printf("    Total calls: %zu\n", total_same_spin_2018_calls);
+      printf("    Total time: %.6f seconds\n", total_same_spin_2018_time);
+      printf("    Average time per call: %.9f seconds\n", total_same_spin_2018_time / total_same_spin_2018_calls);
     }
-    printf("  Hash algorithm (N-2 adaptive):\n");
-    printf("    Total calls: %zu\n", total_hash_calls);
-    printf("    Total time: %.6f seconds\n", total_hash_time);
-    if (total_hash_calls > 0) {
-      printf("    Average time per call: %.9f seconds\n", total_hash_time / total_hash_calls);
+    if (total_same_spin_n2_calls > 0) {
+      printf("  N-2 Hash Algorithm:\n");
+      printf("    Total calls: %zu\n", total_same_spin_n2_calls);
+      printf("    Total time: %.6f seconds\n", total_same_spin_n2_time);
+      printf("    Average time per call: %.9f seconds\n", total_same_spin_n2_time / total_same_spin_n2_calls);
     }
-    printf("  Total same-spin time: %.6f seconds\n", total_loop_time + total_hash_time);
-    printf("  Same-spin fraction of total: %.2f%%\n", 
-           100.0 * (total_loop_time + total_hash_time) / total_hamiltonian_time);
+    if (total_same_spin_adaptive_calls > 0) {
+      printf("  Adaptive Algorithm (legacy compatibility):\n");
+      printf("    Loop calls: %zu (time: %.6fs)\n", total_loop_calls, total_loop_time);
+      printf("    Hash calls: %zu (time: %.6fs)\n", total_hash_calls, total_hash_time);
+      printf("    Total adaptive calls: %zu\n", total_same_spin_adaptive_calls);
+      printf("    Total adaptive time: %.6f seconds\n", total_loop_time + total_hash_time);
+    }
+    printf("  Total same-spin time: %.6f seconds\n", computed_same_spin_time);
+    if (total_hamiltonian_time > 0) {
+      printf("  Same-spin fraction: %.2f%%\n", 100.0 * computed_same_spin_time / total_hamiltonian_time);
+    }
+    
+    // Opposite-spin timing breakdown
+    double computed_opposite_spin_time = total_opposite_spin_2018_time + total_opposite_spin_new_time;
+    
+    printf("\nOpposite-spin excitation timing breakdown:\n");
+    if (total_opposite_spin_2018_calls > 0) {
+      printf("  2018 Algorithm:\n");
+      printf("    Total calls: %zu\n", total_opposite_spin_2018_calls);
+      printf("    Total time: %.6f seconds\n", total_opposite_spin_2018_time);
+      printf("    Average time per call: %.9f seconds\n", total_opposite_spin_2018_time / total_opposite_spin_2018_calls);
+    }
+    if (total_opposite_spin_new_calls > 0) {
+      printf("  New Algorithm (with sub-algorithms):\n");
+      printf("    Total calls: %zu\n", total_opposite_spin_new_calls);
+      printf("    Total time: %.6f seconds\n", total_opposite_spin_new_time);
+      printf("    Average time per call: %.9f seconds\n", total_opposite_spin_new_time / total_opposite_spin_new_calls);
+      
+      if (total_opposite_spin_subalg1_calls > 0) {
+        printf("    Sub-algorithm 1 (Hash existing): %zu calls, %.6fs\n", 
+               total_opposite_spin_subalg1_calls, total_opposite_spin_subalg1_time);
+      }
+      if (total_opposite_spin_subalg2_calls > 0) {
+        printf("    Sub-algorithm 2 (Hash N-1): %zu calls, %.6fs\n", 
+               total_opposite_spin_subalg2_calls, total_opposite_spin_subalg2_time);
+      }
+      if (total_opposite_spin_subalg3_calls > 0) {
+        printf("    Sub-algorithm 3 (Direct): %zu calls, %.6fs\n", 
+               total_opposite_spin_subalg3_calls, total_opposite_spin_subalg3_time);
+      }
+    }
+    printf("  Total opposite-spin time: %.6f seconds\n", computed_opposite_spin_time);
+    if (total_hamiltonian_time > 0) {
+      printf("  Opposite-spin fraction: %.2f%%\n", 100.0 * computed_opposite_spin_time / total_hamiltonian_time);
+    }
+    
+    printf("\nAlgorithm Performance Summary:\n");
+    if (computed_same_spin_time > 0 && computed_opposite_spin_time > 0) {
+      printf("  Same-spin / Opposite-spin ratio: %.2f\n", computed_same_spin_time / computed_opposite_spin_time);
+    }
+    if (total_hamiltonian_time > 0) {
+      double other_time = total_hamiltonian_time - computed_same_spin_time - computed_opposite_spin_time;
+      printf("  Other operations time: %.6f seconds (%.2f%%)\n", 
+             other_time, 100.0 * other_time / total_hamiltonian_time);
+    }
+    
     printf("================================================\n\n");
   }
 }
@@ -1289,4 +1456,619 @@ void Hamiltonian<S>::print_auto_tuning_report() const {
   }
   
   printf("==================================================\n\n");
+}
+
+// Implementation of new opposite-spin algorithms
+
+template <class S>
+HamiltonianSetupData Hamiltonian<S>::setup_variational_hamiltonian(const std::vector<Det>& variational_space) {
+  HamiltonianSetupData setup_data;
+  
+  if (Parallel::is_master() && opposite_spin_debug_output) {
+    printf("Setting up variational Hamiltonian data structures...\n");
+  }
+  
+  // Step 1: Extract unique half-determinants and build maps
+  for (size_t i = 0; i < variational_space.size(); i++) {
+    const Det& det = variational_space[i];
+    
+    // Process up-spin
+    setup_data.up_to_full_map[det.up].push_back(i);
+    if (setup_data.up_det_to_idx.find(det.up) == setup_data.up_det_to_idx.end()) {
+      setup_data.up_det_to_idx[det.up] = setup_data.unique_up_dets.size();
+      setup_data.unique_up_dets.push_back(det.up);
+    }
+    
+    // Process down-spin
+    setup_data.dn_to_full_map[det.dn].push_back(i);
+    if (setup_data.dn_det_to_idx.find(det.dn) == setup_data.dn_det_to_idx.end()) {
+      setup_data.dn_det_to_idx[det.dn] = setup_data.unique_dn_dets.size();
+      setup_data.unique_dn_dets.push_back(det.dn);
+    }
+  }
+  
+  // Step 2: Sort unique determinants by number of corresponding full determinants (descending)
+  std::vector<std::pair<size_t, size_t>> up_counts;
+  std::vector<std::pair<size_t, size_t>> dn_counts;
+  
+  for (size_t i = 0; i < setup_data.unique_up_dets.size(); i++) {
+    up_counts.push_back({i, setup_data.up_to_full_map[setup_data.unique_up_dets[i]].size()});
+  }
+  for (size_t i = 0; i < setup_data.unique_dn_dets.size(); i++) {
+    dn_counts.push_back({i, setup_data.dn_to_full_map[setup_data.unique_dn_dets[i]].size()});
+  }
+  
+  std::sort(up_counts.begin(), up_counts.end(), 
+            [](const auto& a, const auto& b) { return a.second > b.second; });
+  std::sort(dn_counts.begin(), dn_counts.end(), 
+            [](const auto& a, const auto& b) { return a.second > b.second; });
+  
+  // Reorder unique determinants based on sorted counts
+  std::vector<HalfDet> sorted_up_dets;
+  std::vector<HalfDet> sorted_dn_dets;
+  std::unordered_map<size_t, size_t> up_idx_map;  // old_idx -> new_idx
+  std::unordered_map<size_t, size_t> dn_idx_map;
+  
+  for (size_t i = 0; i < up_counts.size(); i++) {
+    size_t old_idx = up_counts[i].first;
+    up_idx_map[old_idx] = i;
+    sorted_up_dets.push_back(setup_data.unique_up_dets[old_idx]);
+  }
+  for (size_t i = 0; i < dn_counts.size(); i++) {
+    size_t old_idx = dn_counts[i].first;
+    dn_idx_map[old_idx] = i;
+    sorted_dn_dets.push_back(setup_data.unique_dn_dets[old_idx]);
+  }
+  
+  setup_data.unique_up_dets = sorted_up_dets;
+  setup_data.unique_dn_dets = sorted_dn_dets;
+  
+  // Update index maps with new ordering
+  setup_data.up_det_to_idx.clear();
+  setup_data.dn_det_to_idx.clear();
+  for (size_t i = 0; i < setup_data.unique_up_dets.size(); i++) {
+    setup_data.up_det_to_idx[setup_data.unique_up_dets[i]] = i;
+  }
+  for (size_t i = 0; i < setup_data.unique_dn_dets.size(); i++) {
+    setup_data.dn_det_to_idx[setup_data.unique_dn_dets[i]] = i;
+  }
+  
+  // Step 3: Build single excitation constructor maps
+  std::unordered_map<HalfDet, std::vector<size_t>, HalfDetHasher> upSingleExciteConstructor;
+  std::unordered_map<HalfDet, std::vector<size_t>, HalfDetHasher> dnSingleExciteConstructor;
+  
+  // For up-spin
+  for (size_t idx_i = 0; idx_i < setup_data.unique_up_dets.size(); idx_i++) {
+    const HalfDet& u_i = setup_data.unique_up_dets[idx_i];
+    std::vector<HalfDet> n_minus_1_configs = generate_n_minus_1_configs(u_i);
+    
+    for (const HalfDet& config : n_minus_1_configs) {
+      upSingleExciteConstructor[config].push_back(idx_i);
+    }
+  }
+  
+  // For down-spin
+  for (size_t idx_i = 0; idx_i < setup_data.unique_dn_dets.size(); idx_i++) {
+    const HalfDet& d_i = setup_data.unique_dn_dets[idx_i];
+    std::vector<HalfDet> n_minus_1_configs = generate_n_minus_1_configs(d_i);
+    
+    for (const HalfDet& config : n_minus_1_configs) {
+      dnSingleExciteConstructor[config].push_back(idx_i);
+    }
+  }
+  
+  // Step 4: Populate singles maps
+  setup_data.upSingles.clear();
+  setup_data.dnSingles.clear();
+  
+  // For up-spin (with idx_j > idx_i condition)
+  for (size_t idx_i = 0; idx_i < setup_data.unique_up_dets.size(); idx_i++) {
+    const HalfDet& u_i = setup_data.unique_up_dets[idx_i];
+    std::vector<HalfDet> n_minus_1_configs = generate_n_minus_1_configs(u_i);
+    
+    std::set<size_t> connected_indices;  // Use set to avoid duplicates
+    for (const HalfDet& config : n_minus_1_configs) {
+      auto it = upSingleExciteConstructor.find(config);
+      if (it != upSingleExciteConstructor.end()) {
+        for (size_t idx_j : it->second) {
+          if (idx_j > idx_i) {  // Only add connections to later indices
+            connected_indices.insert(idx_j);
+          }
+        }
+      }
+    }
+    
+    if (!connected_indices.empty()) {
+      setup_data.upSingles[idx_i] = std::vector<size_t>(connected_indices.begin(), connected_indices.end());
+    }
+  }
+  
+  // For down-spin (all connections)
+  for (size_t idx_i = 0; idx_i < setup_data.unique_dn_dets.size(); idx_i++) {
+    const HalfDet& d_i = setup_data.unique_dn_dets[idx_i];
+    std::vector<HalfDet> n_minus_1_configs = generate_n_minus_1_configs(d_i);
+    
+    std::set<size_t> connected_indices;
+    for (const HalfDet& config : n_minus_1_configs) {
+      auto it = dnSingleExciteConstructor.find(config);
+      if (it != dnSingleExciteConstructor.end()) {
+        for (size_t idx_j : it->second) {
+          if (idx_j != idx_i) {  // All connections except self
+            connected_indices.insert(idx_j);
+          }
+        }
+      }
+    }
+    
+    if (!connected_indices.empty()) {
+      setup_data.dnSingles[idx_i] = std::vector<size_t>(connected_indices.begin(), connected_indices.end());
+    }
+  }
+  
+  if (Parallel::is_master() && opposite_spin_debug_output) {
+    printf("Variational Hamiltonian setup complete:\n");
+    printf("  Unique up-spin dets: %zu\n", setup_data.unique_up_dets.size());
+    printf("  Unique dn-spin dets: %zu\n", setup_data.unique_dn_dets.size());
+    printf("  Up-spin singles connections: %zu\n", setup_data.upSingles.size());
+    printf("  Dn-spin singles connections: %zu\n", setup_data.dnSingles.size());
+  }
+  
+  return setup_data;
+}
+
+// Helper function to generate N-1 electron configurations
+template <class S>
+std::vector<HalfDet> Hamiltonian<S>::generate_n_minus_1_configs(const HalfDet& half_det) const {
+  std::vector<HalfDet> configs;
+  auto occupied_orbs = half_det.get_occupied_orbs();
+  
+  configs.reserve(occupied_orbs.size());
+  for (unsigned orb : occupied_orbs) {
+    HalfDet config = half_det;
+    config.unset(orb);
+    configs.push_back(config);
+  }
+  
+  return configs;
+}
+
+// Helper function to check if two half-determinants differ by a single excitation
+template <class S>
+bool Hamiltonian<S>::is_single_excitation(const HalfDet& det1, const HalfDet& det2) const {
+  return det1.n_diffs(det2) == 2;  // 2 differences = 1 electron moved
+}
+
+// Cost estimation functions for opposite-spin sub-algorithms
+template <class S>
+double Hamiltonian<S>::estimate_opposite_spin_subalg1_cost(size_t n_dn_i, size_t n_up_singles, 
+                                                          size_t avg_dn_singles, size_t avg_dn_j) const {
+  // Sub-algorithm 1: Hash existing connections
+  // Cost = Build hash table from dn singles + Query for each up single's dn dets
+  double build_cost = n_dn_i * avg_dn_singles;  // Building dnCandidates
+  double query_cost = n_up_singles * avg_dn_j;  // Querying for each up single
+  return build_cost + query_cost;
+}
+
+template <class S>
+double Hamiltonian<S>::estimate_opposite_spin_subalg2_cost(size_t n_dn_i, size_t n_up_singles, 
+                                                          size_t avg_dn_j, size_t n_electrons) const {
+  // Sub-algorithm 2: Hash N-1 configurations
+  // Cost = Build N-1 hash table + Query for each up single's dn dets
+  double build_cost = n_dn_i * n_electrons;  // Building dnSingleExciteConstructor
+  double query_cost = n_up_singles * avg_dn_j * n_electrons;  // Querying with N-1 configs
+  return build_cost + query_cost;
+}
+
+template <class S>
+double Hamiltonian<S>::estimate_opposite_spin_subalg3_cost(size_t n_dn_i, size_t n_up_singles, 
+                                                          size_t avg_dn_j) const {
+  // Sub-algorithm 3: Direct comparison
+  // Cost = Triple nested loop
+  return n_up_singles * n_dn_i * avg_dn_j;
+}
+
+// Main function to find opposite-spin excitations using the new algorithm
+template <class S>
+void Hamiltonian<S>::find_opposite_spin_excitations_new(const S& system, 
+                                                       const HamiltonianSetupData& setup_data) {
+  auto start_time = std::chrono::high_resolution_clock::now();
+  
+  if (Parallel::is_master() && opposite_spin_debug_output) {
+    printf("Finding opposite-spin excitations using new algorithm...\n");
+  }
+  
+  // Statistics for algorithm selection
+  size_t total_subalg1_calls = 0;
+  size_t total_subalg2_calls = 0;
+  size_t total_subalg3_calls = 0;
+  
+  // Main loop over unique up-spin determinants (sorted by importance)
+  for (size_t up_idx = 0; up_idx < setup_data.unique_up_dets.size(); up_idx++) {
+    const HalfDet& u_i = setup_data.unique_up_dets[up_idx];
+    
+    // Get down-spin determinants for this up-spin
+    auto up_it = setup_data.up_to_full_map.find(u_i);
+    if (up_it == setup_data.up_to_full_map.end()) continue;
+    
+    std::vector<size_t> dn_indices_i;
+    for (size_t full_idx : up_it->second) {
+      const Det& det = system.dets[full_idx];
+      auto dn_idx_it = setup_data.dn_det_to_idx.find(det.dn);
+      if (dn_idx_it != setup_data.dn_det_to_idx.end()) {
+        dn_indices_i.push_back(dn_idx_it->second);
+      }
+    }
+    
+    // Get up-spin singles for this determinant
+    auto singles_it = setup_data.upSingles.find(up_idx);
+    if (singles_it == setup_data.upSingles.end()) continue;
+    
+    const std::vector<size_t>& up_singles = singles_it->second;
+    if (up_singles.empty()) continue;
+    
+    // Calculate cost estimates for algorithm selection
+    size_t n_dn_i = dn_indices_i.size();
+    size_t n_up_singles = up_singles.size();
+    
+    // Estimate average down-spin properties
+    size_t avg_dn_singles = 0;
+    size_t avg_dn_j = 0;
+    size_t sample_size = std::min(size_t(5), up_singles.size());
+    
+    for (size_t i = 0; i < sample_size; i++) {
+      const HalfDet& u_j = setup_data.unique_up_dets[up_singles[i]];
+      auto up_j_it = setup_data.up_to_full_map.find(u_j);
+      if (up_j_it != setup_data.up_to_full_map.end()) {
+        avg_dn_j += up_j_it->second.size();
+      }
+    }
+    avg_dn_j = (sample_size > 0) ? avg_dn_j / sample_size : 1;
+    
+    // Estimate average dn singles connections
+    sample_size = std::min(size_t(5), dn_indices_i.size());
+    for (size_t i = 0; i < sample_size; i++) {
+      auto dn_singles_it = setup_data.dnSingles.find(dn_indices_i[i]);
+      if (dn_singles_it != setup_data.dnSingles.end()) {
+        avg_dn_singles += dn_singles_it->second.size();
+      }
+    }
+    avg_dn_singles = (sample_size > 0) ? avg_dn_singles / sample_size : 10;
+    
+    // Choose algorithm based on cost model or user preference
+    std::string chosen_algorithm;
+    auto subalg_start_time = std::chrono::high_resolution_clock::now();
+    
+    if (opposite_spin_cost_model == "subalg1") {
+      chosen_algorithm = "subalg1";
+      opposite_spin_subalg1(system, setup_data, up_idx, dn_indices_i, up_singles);
+      total_subalg1_calls++;
+    } else if (opposite_spin_cost_model == "subalg2") {
+      chosen_algorithm = "subalg2";
+      opposite_spin_subalg2(system, setup_data, up_idx, dn_indices_i, up_singles);
+      total_subalg2_calls++;
+    } else if (opposite_spin_cost_model == "subalg3") {
+      chosen_algorithm = "subalg3";
+      opposite_spin_subalg3(system, setup_data, up_idx, dn_indices_i, up_singles);
+      total_subalg3_calls++;
+    } else {  // "auto" - choose based on estimated costs
+      double cost1 = estimate_opposite_spin_subalg1_cost(n_dn_i, n_up_singles, avg_dn_singles, avg_dn_j);
+      double cost2 = estimate_opposite_spin_subalg2_cost(n_dn_i, n_up_singles, avg_dn_j, n_dn);
+      double cost3 = estimate_opposite_spin_subalg3_cost(n_dn_i, n_up_singles, avg_dn_j);
+      
+      if (cost1 <= cost2 && cost1 <= cost3) {
+        chosen_algorithm = "subalg1";
+        opposite_spin_subalg1(system, setup_data, up_idx, dn_indices_i, up_singles);
+        total_subalg1_calls++;
+      } else if (cost2 <= cost3) {
+        chosen_algorithm = "subalg2";
+        opposite_spin_subalg2(system, setup_data, up_idx, dn_indices_i, up_singles);
+        total_subalg2_calls++;
+      } else {
+        chosen_algorithm = "subalg3";
+        opposite_spin_subalg3(system, setup_data, up_idx, dn_indices_i, up_singles);
+        total_subalg3_calls++;
+      }
+    }
+    
+    auto subalg_end_time = std::chrono::high_resolution_clock::now();
+    double subalg_time = std::chrono::duration<double>(subalg_end_time - subalg_start_time).count();
+    
+    // Update timing statistics
+    if (chosen_algorithm == "subalg1") {
+      total_opposite_spin_subalg1_time += subalg_time;
+    } else if (chosen_algorithm == "subalg2") {
+      total_opposite_spin_subalg2_time += subalg_time;
+    } else {
+      total_opposite_spin_subalg3_time += subalg_time;
+    }
+    
+    if (opposite_spin_debug_output && up_idx % 100 == 0) {
+      printf("  Up %zu: %s (n_dn=%zu, n_up_singles=%zu, time=%.3fms)\n", 
+             up_idx, chosen_algorithm.c_str(), n_dn_i, n_up_singles, subalg_time * 1000);
+    }
+  }
+  
+  auto end_time = std::chrono::high_resolution_clock::now();
+  double total_time = std::chrono::duration<double>(end_time - start_time).count();
+  total_opposite_spin_new_time += total_time;
+  total_opposite_spin_new_calls++;
+  
+  // Update sub-algorithm call counts
+  total_opposite_spin_subalg1_calls += total_subalg1_calls;
+  total_opposite_spin_subalg2_calls += total_subalg2_calls;
+  total_opposite_spin_subalg3_calls += total_subalg3_calls;
+  
+  if (Parallel::is_master() && opposite_spin_debug_output) {
+    printf("Opposite-spin excitations complete. Sub-algorithm usage:\n");
+    printf("  Sub-algorithm 1: %zu calls\n", total_subalg1_calls);
+    printf("  Sub-algorithm 2: %zu calls\n", total_subalg2_calls);
+    printf("  Sub-algorithm 3: %zu calls\n", total_subalg3_calls);
+  }
+}
+
+// Sub-algorithm 1: Hash existing connections
+template <class S>
+void Hamiltonian<S>::opposite_spin_subalg1(const S& system,
+                                          const HamiltonianSetupData& setup_data,
+                                          size_t up_idx,
+                                          const std::vector<size_t>& dn_indices_i,
+                                          const std::vector<size_t>& up_singles) {
+  const HalfDet& u_i = setup_data.unique_up_dets[up_idx];
+  
+  // Build hash table of down-spin candidates
+  std::unordered_map<size_t, std::vector<size_t>> dnCandidates;  // dn_idx -> full_det_indices
+  
+  for (size_t dn_idx : dn_indices_i) {
+    auto dn_singles_it = setup_data.dnSingles.find(dn_idx);
+    if (dn_singles_it == setup_data.dnSingles.end()) continue;
+    
+    const HalfDet& d_j = setup_data.unique_dn_dets[dn_idx];
+    
+    // Find full determinant index for (u_i, d_j)
+    size_t full_idx_ij = SIZE_MAX;
+    auto up_it = setup_data.up_to_full_map.find(u_i);
+    if (up_it != setup_data.up_to_full_map.end()) {
+      for (size_t idx : up_it->second) {
+        if (system.dets[idx].dn == d_j) {
+          full_idx_ij = idx;
+          break;
+        }
+      }
+    }
+    
+    if (full_idx_ij == SIZE_MAX) continue;
+    
+    // Add all connected down-spins to candidates
+    for (size_t connected_dn_idx : dn_singles_it->second) {
+      dnCandidates[connected_dn_idx].push_back(full_idx_ij);
+    }
+  }
+  
+  // Query for each up-spin single
+  for (size_t up_j_idx : up_singles) {
+    const HalfDet& u_j = setup_data.unique_up_dets[up_j_idx];
+    
+    auto up_j_it = setup_data.up_to_full_map.find(u_j);
+    if (up_j_it == setup_data.up_to_full_map.end()) continue;
+    
+    // Check each down-spin determinant for u_j
+    for (size_t full_idx_jk : up_j_it->second) {
+      const Det& det_jk = system.dets[full_idx_jk];
+      
+      auto dn_idx_it = setup_data.dn_det_to_idx.find(det_jk.dn);
+      if (dn_idx_it == setup_data.dn_det_to_idx.end()) continue;
+      
+      size_t dn_k_idx = dn_idx_it->second;
+      
+      // Check if this down-spin is in our candidates
+      auto candidates_it = dnCandidates.find(dn_k_idx);
+      if (candidates_it != dnCandidates.end()) {
+        // Found connections: (u_j, d_k) is connected to all dets in candidates
+        for (size_t full_idx_ij : candidates_it->second) {
+          const double H = time_sym ? system.get_hamiltonian_elem_time_sym(system.dets[full_idx_ij], det_jk, -1)
+                                    : system.get_hamiltonian_elem(system.dets[full_idx_ij], det_jk, -1);
+          if (std::abs(H) < Util::EPS) continue;
+          matrix.append_elem(full_idx_ij, full_idx_jk, H);
+        }
+      }
+    }
+  }
+}
+
+// Sub-algorithm 2: Hash N-1 configurations
+template <class S>
+void Hamiltonian<S>::opposite_spin_subalg2(const S& system,
+                                          const HamiltonianSetupData& setup_data,
+                                          size_t up_idx,
+                                          const std::vector<size_t>& dn_indices_i,
+                                          const std::vector<size_t>& up_singles) {
+  const HalfDet& u_i = setup_data.unique_up_dets[up_idx];
+  
+  // Build hash table of N-1 configurations
+  std::unordered_map<HalfDet, std::vector<size_t>, HalfDetHasher> dnSingleExciteConstructor;
+  
+  for (size_t dn_idx : dn_indices_i) {
+    const HalfDet& d_j = setup_data.unique_dn_dets[dn_idx];
+    
+    // Find full determinant index for (u_i, d_j)
+    size_t full_idx_ij = SIZE_MAX;
+    auto up_it = setup_data.up_to_full_map.find(u_i);
+    if (up_it != setup_data.up_to_full_map.end()) {
+      for (size_t idx : up_it->second) {
+        if (system.dets[idx].dn == d_j) {
+          full_idx_ij = idx;
+          break;
+        }
+      }
+    }
+    
+    if (full_idx_ij == SIZE_MAX) continue;
+    
+    // Generate all N-1 configurations for this down-spin
+    std::vector<HalfDet> n_minus_1_configs = generate_n_minus_1_configs(d_j);
+    for (const HalfDet& config : n_minus_1_configs) {
+      dnSingleExciteConstructor[config].push_back(full_idx_ij);
+    }
+  }
+  
+  // Query for each up-spin single
+  for (size_t up_j_idx : up_singles) {
+    const HalfDet& u_j = setup_data.unique_up_dets[up_j_idx];
+    
+    auto up_j_it = setup_data.up_to_full_map.find(u_j);
+    if (up_j_it == setup_data.up_to_full_map.end()) continue;
+    
+    // Check each down-spin determinant for u_j
+    for (size_t full_idx_jk : up_j_it->second) {
+      const Det& det_jk = system.dets[full_idx_jk];
+      
+      // Generate N-1 configurations for this down-spin
+      std::vector<HalfDet> n_minus_1_configs = generate_n_minus_1_configs(det_jk.dn);
+      
+      std::set<size_t> visited_connections;  // Avoid duplicates
+      
+      for (const HalfDet& config : n_minus_1_configs) {
+        auto it = dnSingleExciteConstructor.find(config);
+        if (it != dnSingleExciteConstructor.end()) {
+          // Found connections via this N-1 configuration
+          for (size_t full_idx_ij : it->second) {
+            if (visited_connections.find(full_idx_ij) != visited_connections.end()) continue;
+            visited_connections.insert(full_idx_ij);
+            
+            const double H = time_sym ? system.get_hamiltonian_elem_time_sym(system.dets[full_idx_ij], det_jk, -1)
+                                      : system.get_hamiltonian_elem(system.dets[full_idx_ij], det_jk, -1);
+            if (std::abs(H) < Util::EPS) continue;
+            matrix.append_elem(full_idx_ij, full_idx_jk, H);
+          }
+        }
+      }
+    }
+  }
+}
+
+// Sub-algorithm 3: Direct comparison
+template <class S>
+void Hamiltonian<S>::opposite_spin_subalg3(const S& system,
+                                          const HamiltonianSetupData& setup_data,
+                                          size_t up_idx,
+                                          const std::vector<size_t>& dn_indices_i,
+                                          const std::vector<size_t>& up_singles) {
+  const HalfDet& u_i = setup_data.unique_up_dets[up_idx];
+  
+  // Loop over up-spin singles
+  for (size_t up_j_idx : up_singles) {
+    const HalfDet& u_j = setup_data.unique_up_dets[up_j_idx];
+    
+    // Loop over down-spins for u_i
+    for (size_t dn_i_idx : dn_indices_i) {
+      const HalfDet& d_i = setup_data.unique_dn_dets[dn_i_idx];
+      
+      // Find full determinant index for (u_i, d_i)
+      size_t full_idx_ii = SIZE_MAX;
+      auto up_it = setup_data.up_to_full_map.find(u_i);
+      if (up_it != setup_data.up_to_full_map.end()) {
+        for (size_t idx : up_it->second) {
+          if (system.dets[idx].dn == d_i) {
+            full_idx_ii = idx;
+            break;
+          }
+        }
+      }
+      
+      if (full_idx_ii == SIZE_MAX) continue;
+      
+      // Loop over down-spins for u_j
+      auto up_j_it = setup_data.up_to_full_map.find(u_j);
+      if (up_j_it == setup_data.up_to_full_map.end()) continue;
+      
+      for (size_t full_idx_jj : up_j_it->second) {
+        const Det& det_jj = system.dets[full_idx_jj];
+        
+        // Check if down-spins are single excitations
+        if (is_single_excitation(d_i, det_jj.dn)) {
+          const double H = time_sym ? system.get_hamiltonian_elem_time_sym(system.dets[full_idx_ii], det_jj, -1)
+                                    : system.get_hamiltonian_elem(system.dets[full_idx_ii], det_jj, -1);
+          if (std::abs(H) < Util::EPS) continue;
+          matrix.append_elem(full_idx_ii, full_idx_jj, H);
+        }
+      }
+    }
+  }
+}
+
+// 2018 opposite-spin algorithm (current baseline)
+template <class S>
+void Hamiltonian<S>::find_opposite_spin_excitations_2018(const S& system) {
+  auto start_time = std::chrono::high_resolution_clock::now();
+  
+  if (Parallel::is_master() && opposite_spin_debug_output) {
+    printf("Finding opposite-spin excitations using 2018 algorithm...\n");
+  }
+  
+  // Process connections between different unique alpha/beta pairs
+  const size_t n_unique_alphas = unique_alphas.size();
+  
+  #pragma omp parallel for schedule(static, 1)
+  for (size_t alpha_id = 0; alpha_id < n_unique_alphas; alpha_id++) {
+    const auto& single_alphas = alpha_id_to_single_ids[alpha_id];
+    const auto& beta_ids = alpha_id_to_beta_ids[alpha_id];
+    const auto& det_ids = alpha_id_to_det_ids[alpha_id];
+    
+    for (size_t j = 0; j < single_alphas.size(); j++) {
+      const size_t alpha_single_id = single_alphas[j];
+      const auto& single_beta_ids = alpha_id_to_beta_ids[alpha_single_id];
+      const auto& single_det_ids = alpha_id_to_det_ids[alpha_single_id];
+      
+      // Find connections via single excitations in opposite spin
+      size_t k = 0;
+      size_t l = 0;
+      
+      while (k < beta_ids.size() && l < single_beta_ids.size()) {
+        if (beta_ids[k] < single_beta_ids[l]) {
+          k++;
+        } else if (beta_ids[k] > single_beta_ids[l]) {
+          l++;
+        } else {
+          // Found matching beta, check if it's connected via beta singles
+          const size_t beta_id = beta_ids[k];
+          const auto& beta_singles = time_sym ? alpha_id_to_single_ids[beta_id] : beta_id_to_single_ids[beta_id];
+          
+          // Get the corresponding beta for the single alpha
+          const size_t single_beta_id = single_beta_ids[l];
+          
+          // Check if these betas are connected by a single excitation
+          bool found_connection = false;
+          for (size_t beta_single : beta_singles) {
+            if (beta_single == single_beta_id) {
+              found_connection = true;
+              break;
+            }
+          }
+          
+          if (found_connection) {
+            // Found opposite-spin connection
+            const size_t det_id = det_ids[k];
+            const size_t single_det_id = single_det_ids[l];
+            
+            const double H = time_sym ? system.get_hamiltonian_elem_time_sym(system.dets[det_id], system.dets[single_det_id], -1)
+                                      : system.get_hamiltonian_elem(system.dets[det_id], system.dets[single_det_id], -1);
+            if (std::abs(H) >= Util::EPS) {
+              matrix.append_elem(det_id, single_det_id, H);
+            }
+          }
+          k++;
+          l++;
+        }
+      }
+    }
+  }
+  
+  auto end_time = std::chrono::high_resolution_clock::now();
+  double total_time = std::chrono::duration<double>(end_time - start_time).count();
+  total_opposite_spin_2018_time += total_time;
+  total_opposite_spin_2018_calls++;
+  
+  if (Parallel::is_master() && opposite_spin_debug_output) {
+    printf("2018 opposite-spin excitations complete (time: %.3fs)\n", total_time);
+  }
 }
