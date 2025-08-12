@@ -31,7 +31,8 @@ MAIN_SRC := $(SRC_DIR)/main.cc
 SRCS := $(shell find $(SRC_DIR) ! -name "main.cc" ! -name "*_test.cc" -name "*.cc")
 HEADERS := $(shell find $(SRC_DIR) -name "*.h")
 SUBMODULES := $(LIB_DIR)/eigen $(LIB_DIR)/googletest $(LIB_DIR)/hpmr $(LIB_DIR)/hps $(LIB_DIR)/json
-OBJS := $(SRCS:$(SRC_DIR)/%.cc=$(BUILD_DIR)/%.o)
+SRC_OBJS := $(SRCS:$(SRC_DIR)/%.cc=$(BUILD_DIR)/%.o)
+OBJS := $(SRC_OBJS) $(BUILD_DIR)/mpi_type.o
 TESTS := $(shell find $(SRC_DIR) -name "*_test.cc")
 GTEST_DIR := $(LIB_DIR)/googletest/googletest
 GMOCK_DIR := $(LIB_DIR)/googletest/googlemock
@@ -60,7 +61,10 @@ clean:
 $(EXE): $(OBJS) $(MAIN_SRC) $(HEADERS) $(GPERFTOOLS_DIR)
 	$(CXX) $(CXXFLAGS) $(MAIN_SRC) $(OBJS) -o $(EXE) $(LDLIBS)
 
-$(OBJS): $(BUILD_DIR)/%.o: $(SRC_DIR)/%.cc $(HEADERS)
+$(BUILD_DIR)/mpi_type.o: $(LIB_DIR)/fgpl/src/internal/mpi_type.cc
+	mkdir -p $(@D) && $(CXX) $(CXXFLAGS) -c $< -o $@
+
+$(SRC_OBJS): $(BUILD_DIR)/%.o: $(SRC_DIR)/%.cc $(HEADERS)
 	mkdir -p $(@D) && $(CXX) $(CXXFLAGS) -c $< -o $@
 
 $(TEST_EXE): $(TEST_OBJS) $(OBJS) $(TEST_MAIN_SRC) $(TEST_LIB) 
