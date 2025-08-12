@@ -1487,7 +1487,7 @@ std::vector<double> Solver<S>::generate_automated_epsilon_schedule(const double 
   const double eps0 = std::min(max_H_same, max_H_opp);
   
   // Get the epsilon schedule algorithm from config
-  const std::string schedule_algorithm = Config::get<std::string>("epsilon_schedule_algorithm", "geometric_mean");
+  const std::string schedule_algorithm = Config::get<std::string>("epsilon_schedule_algorithm", "divide_by_2");
   
   std::vector<double> schedule;
   
