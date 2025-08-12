@@ -11,7 +11,7 @@ Arrow is a selected configuration interaction plus perturbation theory (SCI+PT) 
 ### Prerequisites
 - MPI compiler (e.g., `mpic++`)
 - OpenMP support
-- C++11 compatible compiler
+- C++14 compatible compiler
 
 ### Build Instructions
 ```bash
