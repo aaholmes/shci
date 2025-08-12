@@ -6,8 +6,28 @@ Arrow enables massively parallel computations using the SHCI method with MPI+Ope
 
 [![Build Status](https://travis-ci.com/QMC-Cornell/shci.svg?token=Gy8pVWtUBHq57qdtpAKN&branch=master)](https://travis-ci.com/QMC-Cornell/shci) 
 
+## Installation
+
+### Prerequisites
+- MPI compiler (e.g., `mpic++`)
+- OpenMP support
+- C++11 compatible compiler
+
+### Build Instructions
+```bash
+# Clone the repository
+git clone https://github.com/aaholmes/shci.git
+cd shci
+
+# Initialize and update submodules
+git submodule update --init --recursive
+
+# Build the project
+make -j
+```
+
 ## How to Run
-Instructions for installing and running Arrow are documented in the [wiki](https://github.com/QMC-Cornell/shci/wiki).
+Instructions for running Arrow are documented in the [wiki](https://github.com/QMC-Cornell/shci/wiki).
 
 ## How to Contribute
 
