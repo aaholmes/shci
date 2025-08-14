@@ -56,7 +56,7 @@ class Hamiltonian {
 
   bool sort_by_det_id = false;
 
-  size_t samespin_hash_threshold = 1000;
+  size_t samespin_hash_threshold = 999999;
 
   std::vector<HalfDet> unique_alphas;
 
@@ -115,6 +115,12 @@ class Hamiltonian {
   void find_same_spin_excitations_hash_batch(const S& system,
                                              const std::vector<size_t>& new_det_indices, 
                                              const std::vector<size_t>& old_det_indices);
+
+  // Cornell 2018-style algorithm for group-based processing
+  void find_same_spin_excitations_2018_batch(const S& system,
+                                             const std::vector<size_t>& new_det_indices, 
+                                             const std::vector<size_t>& old_det_indices,
+                                             bool is_alpha_excitation);
                                        
   void generate_n_minus_2_cores(const HalfDet& half_det, std::vector<HalfDet>& cores_out) const;
   
@@ -122,6 +128,9 @@ class Hamiltonian {
   HamiltonianSetupData setup_variational_hamiltonian(const std::vector<Det>& variational_space);
   
   void find_opposite_spin_excitations_2018(const S& system);
+  
+  // Cornell-style 2018 algorithm refactored for alpha-grouping
+  void find_excitations_cornell_style_2018(const S& system);
   
   void find_opposite_spin_excitations_new(const S& system, 
                                           const HamiltonianSetupData& setup_data);
@@ -185,8 +194,10 @@ class Hamiltonian {
   // Legacy compatibility (maps to adaptive algorithm)
   double total_loop_time = 0.0;
   double total_hash_time = 0.0;
+  double total_2018_batch_time = 0.0;
   size_t total_loop_calls = 0;
   size_t total_hash_calls = 0;
+  size_t total_2018_batch_calls = 0;
   
   // Per-alpha-group timing data for Test Plan B
   std::vector<size_t> alpha_group_ids;
@@ -197,11 +208,11 @@ class Hamiltonian {
   // Auto-tuning framework for dynamic threshold determination
   size_t auto_tuning_samples = 20;
   size_t dynamic_threshold = 1000;  // Will be updated each iteration
-  bool auto_tuning_enabled = true;
+  bool auto_tuning_enabled = false;
   bool use_reusable_hash_map = true;  // Memory optimization for N-2 hash algorithm
   
   // Algorithm selection parameters
-  std::string same_spin_algorithm = "adaptive";  // "2018", "n2", "adaptive"
+  std::string same_spin_algorithm = "2018";  // "2018", "n2", "adaptive", "loop"
   std::string opposite_spin_algorithm = "2018";  // "2018", "new"
   std::string opposite_spin_cost_model = "auto"; // "auto", "subalg1", "subalg2", "subalg3"
   bool opposite_spin_debug_output = false;
@@ -246,7 +257,7 @@ Hamiltonian<S>::Hamiltonian() {
   dynamic_threshold = samespin_hash_threshold;  // Initialize with static threshold
   
   // Algorithm selection configuration
-  same_spin_algorithm = Config::get<std::string>("same_spin_algorithm", "adaptive");
+  same_spin_algorithm = Config::get<std::string>("same_spin_algorithm", "2018");
   opposite_spin_algorithm = Config::get<std::string>("opposite_spin_algorithm", "2018");
   opposite_spin_cost_model = Config::get<std::string>("opposite_spin_cost_model", "auto");
   opposite_spin_debug_output = Config::get<bool>("opposite_spin_debug_output", false);
@@ -599,8 +610,14 @@ void Hamiltonian<S>::update_matrix(const S& system) {
   }
 
   // Step 1: Group All Determinants by HalfDet
+  // Always use half-det grouping approach
+  if (Parallel::is_master()) {
+    printf("DEBUG: same_spin_algorithm = '%s'\n", same_spin_algorithm.c_str());
+  }
+
   // Map from a HalfDet spin-string to all determinant indices that contain it.
-  std::unordered_map<HalfDet, std::vector<size_t>, HalfDetHasher> det_groups;
+  std::unordered_map<HalfDet, std::vector<size_t>, HalfDetHasher> alpha_det_groups;
+  std::unordered_map<HalfDet, std::vector<size_t>, HalfDetHasher> beta_det_groups;
   
   // Add diagonal elements for new determinants first
   for (size_t det_id = 0; det_id < n_dets; det_id++) {
@@ -612,13 +629,15 @@ void Hamiltonian<S>::update_matrix(const S& system) {
       matrix.append_elem(det_id, det_id, H);
     }
     
-    // Group determinants by their alpha half-determinant for same-spin excitations
+    // Group determinants by their alpha AND beta half-determinants
     const auto& alpha = det.up;
-    det_groups[alpha].push_back(det_id);
+    const auto& beta = det.dn;
+    alpha_det_groups[alpha].push_back(det_id);
+    beta_det_groups[beta].push_back(det_id);
   }
-
-  // Step 2: Create the Main Loop Over HalfDet Groups
-  for (auto const& group_pair : det_groups) {
+  
+  // Step 2a: Handle alpha excitations (dets with same beta)
+  for (auto const& group_pair : beta_det_groups) {
     const auto& half_det = group_pair.first;
     const auto& det_indices = group_pair.second;
     // Step 3: Implement Per-Group Adaptive Logic
@@ -655,32 +674,53 @@ void Hamiltonian<S>::update_matrix(const S& system) {
     //   Hash: time = hash_coeff_a * M + hash_coeff_b * M_new + hash_coeff_c
     size_t M_new = new_det_indices.size();
     
-    if (auto_tuning_enabled && calibration_data.size() >= 3) {
-      // Use fitted cost models for decision
-      double time_loop = loop_coeff_a * (M_new * N) + loop_coeff_b;
-      double time_hash = hash_coeff_a * N + hash_coeff_b * M_new + hash_coeff_c;
-      
-      if (time_loop <= time_hash) {
-        algorithm_chosen = "Loop";
-        find_same_spin_excitations_loop_batch(system, new_det_indices, old_det_indices);
-        total_loop_calls++;
+    // Check if we're forcing a specific algorithm
+    if (same_spin_algorithm == "2018") {
+      algorithm_chosen = "2018";
+      find_same_spin_excitations_2018_batch(system, new_det_indices, old_det_indices, true);  // true = alpha excitations (same beta group)
+      total_2018_batch_calls++;
+    } else if (same_spin_algorithm == "loop") {
+      algorithm_chosen = "Loop";
+      find_same_spin_excitations_loop_batch(system, new_det_indices, old_det_indices);
+      total_loop_calls++;
+    } else if (same_spin_algorithm == "hash") {
+      algorithm_chosen = "N-2 Hash";
+      find_same_spin_excitations_hash_batch(system, new_det_indices, old_det_indices);
+      total_hash_calls++;
+    } else if (same_spin_algorithm == "adaptive") {
+      // Use adaptive selection
+      if (auto_tuning_enabled && calibration_data.size() >= 3) {
+        // Use fitted cost models for decision
+        double time_loop = loop_coeff_a * (M_new * N) + loop_coeff_b;
+        double time_hash = hash_coeff_a * N + hash_coeff_b * M_new + hash_coeff_c;
+        
+        if (time_loop <= time_hash) {
+          algorithm_chosen = "Loop";
+          find_same_spin_excitations_loop_batch(system, new_det_indices, old_det_indices);
+          total_loop_calls++;
+        } else {
+          algorithm_chosen = "N-2 Hash";
+          find_same_spin_excitations_hash_batch(system, new_det_indices, old_det_indices);
+          total_hash_calls++;
+        }
       } else {
-        algorithm_chosen = "N-2 Hash";
-        find_same_spin_excitations_hash_batch(system, new_det_indices, old_det_indices);
-        total_hash_calls++;
+        // Fallback to simple threshold-based decision
+        size_t threshold_to_use = auto_tuning_enabled ? dynamic_threshold : samespin_hash_threshold;
+        if (N < threshold_to_use) {
+          algorithm_chosen = "Loop";
+          find_same_spin_excitations_loop_batch(system, new_det_indices, old_det_indices);
+          total_loop_calls++;
+        } else {
+          algorithm_chosen = "N-2 Hash";
+          find_same_spin_excitations_hash_batch(system, new_det_indices, old_det_indices);
+          total_hash_calls++;
+        }
       }
     } else {
-      // Fallback to simple threshold-based decision
-      size_t threshold_to_use = auto_tuning_enabled ? dynamic_threshold : samespin_hash_threshold;
-      if (N < threshold_to_use) {
-        algorithm_chosen = "Loop";
-        find_same_spin_excitations_loop_batch(system, new_det_indices, old_det_indices);
-        total_loop_calls++;
-      } else {
-        algorithm_chosen = "N-2 Hash";
-        find_same_spin_excitations_hash_batch(system, new_det_indices, old_det_indices);
-        total_hash_calls++;
-      }
+      // Default to 2018 algorithm
+      algorithm_chosen = "2018";
+      find_same_spin_excitations_2018_batch(system, new_det_indices, old_det_indices, true);  // true = alpha excitations
+      total_2018_batch_calls++;
     }
     
     auto end_group_time = std::chrono::high_resolution_clock::now();
@@ -688,8 +728,10 @@ void Hamiltonian<S>::update_matrix(const S& system) {
     
     if (algorithm_chosen == "Loop") {
       total_loop_time += group_time;
-    } else {
+    } else if (algorithm_chosen == "N-2 Hash") {
       total_hash_time += group_time;
+    } else if (algorithm_chosen == "2018") {
+      total_2018_batch_time += group_time;
     }
     
     // Store per-group data for reporting (using first determinant as representative)
@@ -703,6 +745,98 @@ void Hamiltonian<S>::update_matrix(const S& system) {
       alpha_group_beta_counts.push_back(N);
       alpha_group_algorithms.push_back(algorithm_chosen);
       alpha_group_times.push_back(group_time * 1000.0); // Convert to ms
+    }
+  }
+  
+  // Step 2b: Handle beta excitations (dets with same alpha)
+  for (auto const& group_pair : alpha_det_groups) {
+    const auto& half_det = group_pair.first;
+    const auto& det_indices = group_pair.second;
+    
+    // Partition det_indices into new and old determinants
+    std::vector<size_t> new_det_indices;
+    std::vector<size_t> old_det_indices;
+    
+    for (size_t det_id : det_indices) {
+      if (det_id >= n_dets_prev) {
+        new_det_indices.push_back(det_id);
+      } else {
+        old_det_indices.push_back(det_id);
+      }
+    }
+    
+    // If no new determinants in this group, skip
+    if (new_det_indices.empty()) {
+      continue;
+    }
+    
+    // Calculate N for cost model
+    size_t N = det_indices.size();
+    
+    // Per-group timing and algorithm selection tracking
+    auto start_group_time = std::chrono::high_resolution_clock::now();
+    
+    std::string algorithm_chosen;
+    
+    // Check if we're forcing a specific algorithm
+    if (same_spin_algorithm == "2018") {
+      algorithm_chosen = "2018";
+      find_same_spin_excitations_2018_batch(system, new_det_indices, old_det_indices, false);  // false = beta excitations (same alpha group)
+      total_2018_batch_calls++;
+    } else if (same_spin_algorithm == "loop") {
+      algorithm_chosen = "Loop";
+      find_same_spin_excitations_loop_batch(system, new_det_indices, old_det_indices);
+      total_loop_calls++;
+    } else if (same_spin_algorithm == "hash") {
+      algorithm_chosen = "N-2 Hash";
+      find_same_spin_excitations_hash_batch(system, new_det_indices, old_det_indices);
+      total_hash_calls++;
+    } else if (same_spin_algorithm == "adaptive") {
+      // Use adaptive selection
+      size_t M_new = new_det_indices.size();
+      if (auto_tuning_enabled && calibration_data.size() >= 3) {
+        // Use fitted cost models for decision
+        double time_loop = loop_coeff_a * (M_new * N) + loop_coeff_b;
+        double time_hash = hash_coeff_a * N + hash_coeff_b * M_new + hash_coeff_c;
+        
+        if (time_loop <= time_hash) {
+          algorithm_chosen = "Loop";
+          find_same_spin_excitations_loop_batch(system, new_det_indices, old_det_indices);
+          total_loop_calls++;
+        } else {
+          algorithm_chosen = "N-2 Hash";
+          find_same_spin_excitations_hash_batch(system, new_det_indices, old_det_indices);
+          total_hash_calls++;
+        }
+      } else {
+        // Fallback to simple threshold-based decision
+        size_t threshold_to_use = auto_tuning_enabled ? dynamic_threshold : samespin_hash_threshold;
+        if (N < threshold_to_use) {
+          algorithm_chosen = "Loop";
+          find_same_spin_excitations_loop_batch(system, new_det_indices, old_det_indices);
+          total_loop_calls++;
+        } else {
+          algorithm_chosen = "N-2 Hash";
+          find_same_spin_excitations_hash_batch(system, new_det_indices, old_det_indices);
+          total_hash_calls++;
+        }
+      }
+    } else {
+      // Default to 2018 algorithm
+      algorithm_chosen = "2018";
+      find_same_spin_excitations_2018_batch(system, new_det_indices, old_det_indices, true);  // true = alpha excitations
+      total_2018_batch_calls++;
+    }
+    
+    auto end_group_time = std::chrono::high_resolution_clock::now();
+    double group_time = std::chrono::duration<double>(end_group_time - start_group_time).count();
+    
+    if (algorithm_chosen == "Loop") {
+      total_loop_time += group_time;
+    } else if (algorithm_chosen == "N-2 Hash") {
+      total_hash_time += group_time;
+    } else if (algorithm_chosen == "2018") {
+      total_2018_batch_time += group_time;
     }
   }
 
@@ -1005,6 +1139,85 @@ void Hamiltonian<S>::find_same_spin_excitations_hash_batch(const S& system,
   }
 }
 
+// 2018 algorithm: simple loop over all pairs within half-det group
+// This replicates the Cornell 2018 algorithm logic within a single half-det group
+template <class S>
+void Hamiltonian<S>::find_same_spin_excitations_2018_batch(const S& system,
+                                                          const std::vector<size_t>& new_det_indices, 
+                                                          const std::vector<size_t>& old_det_indices,
+                                                          bool is_alpha_excitation) {
+  // Handle connections from ALL dets to new dets
+  // This mimics Cornell's behavior where each det connects to dets with higher indices
+  
+  // First, handle old dets connecting to new dets
+  // Old dets connect to ALL new dets (since new_det_id > old_det_id always)
+  for (size_t old_det_id : old_det_indices) {
+    const auto& old_det = system.dets[old_det_id];
+    
+    for (size_t new_det_id : new_det_indices) {
+      const auto& new_det = system.dets[new_det_id];
+      
+      // Check if this is a valid same-spin excitation in the correct spin channel
+      // For alpha excitations: check up spins differ (when grouped by same beta)
+      // For beta excitations: check down spins differ (when grouped by same alpha)
+      const int up_diffs = old_det.up.n_diffs(new_det.up);
+      const int dn_diffs = old_det.dn.n_diffs(new_det.dn);
+      
+      // Skip if not the right type of excitation
+      if (is_alpha_excitation) {
+        // Alpha excitations: up spins must differ by 1 or 2, down spins must be same
+        if (!(up_diffs > 0 && up_diffs <= 2 && dn_diffs == 0)) continue;
+      } else {
+        // Beta excitations: down spins must differ by 1 or 2, up spins must be same  
+        if (!(dn_diffs > 0 && dn_diffs <= 2 && up_diffs == 0)) continue;
+      }
+      
+      const double H = time_sym ? system.get_hamiltonian_elem_time_sym(old_det, new_det, -1)
+                                : system.get_hamiltonian_elem(old_det, new_det, -1);
+      if (std::abs(H) < Util::EPS) continue;
+      
+      // Always add as (old_det_id, new_det_id) since old < new
+      matrix.append_elem(old_det_id, new_det_id, H);
+    }
+  }
+  
+  // Second, handle new dets connecting to other new dets
+  // For new-to-new, only connect when det_id_1 < det_id_2 to avoid duplicates
+  for (size_t i = 0; i < new_det_indices.size(); i++) {
+    const size_t new_det_id_1 = new_det_indices[i];
+    const auto& new_det_1 = system.dets[new_det_id_1];
+    
+    for (size_t j = 0; j < new_det_indices.size(); j++) {
+      const size_t new_det_id_2 = new_det_indices[j];
+      
+      // Skip if not maintaining upper triangular structure
+      if (new_det_id_2 <= new_det_id_1) continue;
+      
+      const auto& new_det_2 = system.dets[new_det_id_2];
+      
+      // Check if this is a valid same-spin excitation in the correct spin channel
+      const int up_diffs = new_det_1.up.n_diffs(new_det_2.up);
+      const int dn_diffs = new_det_1.dn.n_diffs(new_det_2.dn);
+      
+      // Skip if not the right type of excitation
+      if (is_alpha_excitation) {
+        // Alpha excitations: up spins must differ by 1 or 2, down spins must be same
+        if (!(up_diffs > 0 && up_diffs <= 2 && dn_diffs == 0)) continue;
+      } else {
+        // Beta excitations: down spins must differ by 1 or 2, up spins must be same
+        if (!(dn_diffs > 0 && dn_diffs <= 2 && up_diffs == 0)) continue;
+      }
+      
+      const double H = time_sym ? system.get_hamiltonian_elem_time_sym(new_det_1, new_det_2, -1)
+                                : system.get_hamiltonian_elem(new_det_1, new_det_2, -1);
+      if (std::abs(H) < Util::EPS) continue;
+      
+      // Add as (new_det_id_1, new_det_id_2) where id_1 < id_2
+      matrix.append_elem(new_det_id_1, new_det_id_2, H);
+    }
+  }
+}
+
 // Print timing summary for benchmarking
 template <class S>
 void Hamiltonian<S>::print_timing_summary() const {
@@ -1013,7 +1226,7 @@ void Hamiltonian<S>::print_timing_summary() const {
     printf("Total Hamiltonian construction time: %.6f seconds\n", total_hamiltonian_time);
     
     // Same-spin timing breakdown
-    double computed_same_spin_time = total_same_spin_2018_time + total_same_spin_n2_time + total_loop_time + total_hash_time;
+    double computed_same_spin_time = total_same_spin_2018_time + total_same_spin_n2_time + total_loop_time + total_hash_time + total_2018_batch_time;
     
     printf("\nSame-spin excitation timing breakdown:\n");
     if (total_same_spin_2018_calls > 0) {
@@ -1027,6 +1240,12 @@ void Hamiltonian<S>::print_timing_summary() const {
       printf("    Total calls: %zu\n", total_same_spin_n2_calls);
       printf("    Total time: %.6f seconds\n", total_same_spin_n2_time);
       printf("    Average time per call: %.9f seconds\n", total_same_spin_n2_time / total_same_spin_n2_calls);
+    }
+    if (total_2018_batch_calls > 0) {
+      printf("  2018 Batch Algorithm:\n");
+      printf("    Total calls: %zu\n", total_2018_batch_calls);
+      printf("    Total time: %.6f seconds\n", total_2018_batch_time);
+      printf("    Average time per call: %.9f seconds\n", total_2018_batch_time / total_2018_batch_calls);
     }
     if (total_same_spin_adaptive_calls > 0) {
       printf("  Adaptive Algorithm (legacy compatibility):\n");
@@ -2070,5 +2289,155 @@ void Hamiltonian<S>::find_opposite_spin_excitations_2018(const S& system) {
   
   if (Parallel::is_master() && opposite_spin_debug_output) {
     printf("2018 opposite-spin excitations complete (time: %.3fs)\n", total_time);
+  }
+}
+
+// Cornell-style 2018 algorithm refactored for alpha-grouping
+// This is mathematically equivalent to Cornell's algorithm but organized by alpha groups
+template <class S>
+void Hamiltonian<S>::find_excitations_cornell_style_2018(const S& system) {
+  auto start_time = std::chrono::high_resolution_clock::now();
+  
+  if (Parallel::is_master()) {
+    printf("Using Cornell-style 2018 algorithm (alpha-grouped)...\n");
+  }
+  
+  // Process determinants in order (same as Cornell) 
+  // Note: This could be optimized with alpha-grouping later, but for correctness we maintain exact ordering
+  for (size_t det_id = 0; det_id < n_dets; det_id++) {
+      const auto& det = system.dets[det_id];
+      const bool is_new_det = det_id >= n_dets_prev;
+      
+      // Add diagonal element for new determinants
+      if (is_new_det) {
+        const double H = time_sym ? system.get_hamiltonian_elem_time_sym(det, det, 0)
+                                  : system.get_hamiltonian_elem(det, det, 0);
+        matrix.append_elem(det_id, det_id, H);
+      }
+      
+      const size_t start_id = is_new_det ? det_id + 1 : n_dets_prev;
+
+      // === SAME-SPIN EXCITATIONS ===
+      
+      // 1. Alpha excitations (single or double alpha excitations)
+      const auto& beta = det.dn;
+      const size_t beta_id = time_sym ? alpha_to_id[beta] : beta_to_id[beta];
+      const auto& alpha_dets = beta_id_to_det_ids[beta_id];
+      for (auto it = alpha_dets.begin(); it != alpha_dets.end(); it++) {
+        const size_t alpha_det_id = *it;
+        if (alpha_det_id < start_id) continue;
+        const auto& connected_det = system.dets[alpha_det_id];
+        const double H = time_sym ? system.get_hamiltonian_elem_time_sym(det, connected_det, -1)
+                                  : system.get_hamiltonian_elem(det, connected_det, -1);
+        if (std::abs(H) < Util::EPS) continue;
+        matrix.append_elem(det_id, alpha_det_id, H);
+      }
+      if (time_sym && alpha_id_to_det_ids.size() > beta_id && det.up != det.dn) {
+        const auto& alpha_dets = alpha_id_to_det_ids[beta_id];
+        for (auto it = alpha_dets.begin(); it != alpha_dets.end(); it++) {
+          const size_t alpha_det_id = *it;
+          if (alpha_det_id < start_id) continue;
+          const auto& connected_det = system.dets[alpha_det_id];
+          if (connected_det.up == connected_det.dn) continue;
+          const double H = system.get_hamiltonian_elem_time_sym(det, connected_det, -1);
+          if (std::abs(H) < Util::EPS) continue;
+          matrix.append_elem(det_id, alpha_det_id, H);
+        }
+      }
+
+      // 2. Beta excitations (single or double beta excitations)
+      const auto& alpha = det.up;
+      const size_t alpha_id = alpha_to_id[alpha];
+      const auto& beta_dets = alpha_id_to_det_ids[alpha_id];
+      for (auto it = beta_dets.begin(); it != beta_dets.end(); it++) {
+        const size_t beta_det_id = *it;
+        if (beta_det_id < start_id) continue;
+        const auto& connected_det = system.dets[beta_det_id];
+        const double H = time_sym ? system.get_hamiltonian_elem_time_sym(det, connected_det, -1)
+                                  : system.get_hamiltonian_elem(det, connected_det, -1);
+        if (std::abs(H) < Util::EPS) continue;
+        matrix.append_elem(det_id, beta_det_id, H);
+      }
+      if (time_sym && beta_id_to_det_ids.size() > alpha_id && det.up != det.dn) {
+        const auto& beta_dets = beta_id_to_det_ids[alpha_id];
+        for (auto it = beta_dets.begin(); it != beta_dets.end(); it++) {
+          const size_t beta_det_id = *it;
+          if (beta_det_id < start_id) continue;
+          const auto& connected_det = system.dets[beta_det_id];
+          if (connected_det.up == connected_det.dn) continue;
+          const double H = system.get_hamiltonian_elem_time_sym(det, connected_det, -1);
+          if (std::abs(H) < Util::EPS) continue;
+          matrix.append_elem(det_id, beta_det_id, H);
+        }
+      }
+
+      // === OPPOSITE-SPIN EXCITATIONS (MIXED DOUBLE) ===
+      
+      // 3. Mixed double excitations
+      if (!system.has_double_excitation && !system.time_sym) continue;
+      const auto& alpha_singles = alpha_id_to_single_ids[alpha_id];
+      const auto& beta_singles =
+          time_sym ? alpha_id_to_single_ids[beta_id] : beta_id_to_single_ids[beta_id];
+      for (const auto alpha_single : alpha_singles) {
+        if (alpha_id_to_beta_ids.size() <= alpha_single) continue;
+        if (time_sym && alpha_single == beta_id) continue;
+        const auto& related_beta_ids = alpha_id_to_beta_ids[alpha_single];
+        const auto& related_det_ids = alpha_id_to_det_ids[alpha_single];
+        const size_t n_related_dets = related_beta_ids.size();
+        if (sort_by_det_id) {
+          const auto& start_ptr =
+              std::lower_bound(related_det_ids.begin(), related_det_ids.end(), start_id);
+          const size_t start_related_id = start_ptr - related_det_ids.begin();
+          for (size_t related_id = start_related_id; related_id < n_related_dets; related_id++) {
+            const size_t related_beta = related_beta_ids[related_id];
+            if (time_sym && related_beta == alpha_id) continue;
+            if (std::binary_search(beta_singles.begin(), beta_singles.end(), related_beta)) {
+              const size_t related_det_id = related_det_ids[related_id];
+              const auto& connected_det = system.dets[related_det_id];
+              const double H = time_sym
+                                   ? system.get_hamiltonian_elem_time_sym(det, connected_det, 2)
+                                   : system.get_hamiltonian_elem(det, connected_det, 2);
+              if (std::abs(H) < Util::EPS) continue;
+              matrix.append_elem(det_id, related_det_id, H);
+            }
+          }
+        } else {
+          size_t ptr = 0;
+          for (auto it = beta_singles.begin(); it != beta_singles.end(); it++) {
+            const size_t beta_single = *it;
+            if (time_sym && beta_single == alpha_id) continue;
+            while (ptr < n_related_dets && related_beta_ids[ptr] < beta_single) {
+              ptr++;
+            }
+            if (ptr == n_related_dets) break;
+            if (related_beta_ids[ptr] == beta_single) {
+              const size_t related_det_id = related_det_ids[ptr];
+              ptr++;
+              if (related_det_id < start_id) continue;
+              const auto& connected_det = system.dets[related_det_id];
+              const double H = time_sym
+                                   ? system.get_hamiltonian_elem_time_sym(det, connected_det, 2)
+                                   : system.get_hamiltonian_elem(det, connected_det, 2);
+              if (std::abs(H) < Util::EPS) continue;
+              matrix.append_elem(det_id, related_det_id, H);
+            }
+          }
+        }
+      }
+    }
+  
+  const size_t n_elems = matrix.count_n_elems();
+  if (Parallel::is_master()) {
+    printf("Number of nonzero elems: %'zu\n", n_elems);
+  }
+  matrix.cache_diag();
+  
+  auto end_time = std::chrono::high_resolution_clock::now();
+  double total_time = std::chrono::duration<double>(end_time - start_time).count();
+  total_same_spin_2018_time += total_time;
+  total_same_spin_2018_calls++;
+  
+  if (Parallel::is_master()) {
+    printf("Cornell-style 2018 algorithm complete (time: %.3fs)\n", total_time);
   }
 }
