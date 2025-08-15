@@ -595,6 +595,13 @@ void Hamiltonian<S>::update_absingles(const S& system) {
 
 template <class S>
 void Hamiltonian<S>::update_matrix(const S& system) {
+  if (Parallel::is_master()) {
+    printf("DEBUG: ======= ENTERING update_matrix =======\n");
+    printf("DEBUG: n_dets = %zu\n", system.get_n_dets());
+    printf("DEBUG: has_double_excitation = %s\n", system.has_double_excitation ? "true" : "false");
+    printf("DEBUG: time_sym = %s\n", time_sym ? "true" : "false");
+  }
+  
   matrix.set_dim(system.get_n_dets());
   
   auto start_hamiltonian_time = std::chrono::high_resolution_clock::now();
@@ -642,6 +649,7 @@ void Hamiltonian<S>::update_matrix(const S& system) {
   if (Parallel::is_master()) {
     printf("Processing alpha excitations using %s algorithm...\n", same_spin_algorithm.c_str());
   }
+  bool processing_alpha_excitations = true;
   for (auto const& group_pair : beta_det_groups) {
     const auto& half_det = group_pair.first;
     const auto& det_indices = group_pair.second;
@@ -757,6 +765,7 @@ void Hamiltonian<S>::update_matrix(const S& system) {
   if (Parallel::is_master()) {
     printf("Processing beta excitations using %s algorithm...\n", same_spin_algorithm.c_str());
   }
+  processing_alpha_excitations = false;
   for (auto const& group_pair : alpha_det_groups) {
     const auto& half_det = group_pair.first;
     const auto& det_indices = group_pair.second;
@@ -850,6 +859,13 @@ void Hamiltonian<S>::update_matrix(const S& system) {
 
   // Handle opposite-spin excitations based on selected algorithm
   auto opposite_spin_start_time = std::chrono::high_resolution_clock::now();
+  
+  if (Parallel::is_master()) {
+    printf("DEBUG: About to call opposite-spin algorithm: %s\n", opposite_spin_algorithm.c_str());
+    printf("DEBUG: has_double_excitation = %s, time_sym = %s\n", 
+           system.has_double_excitation ? "true" : "false",
+           time_sym ? "true" : "false");
+  }
   
   if (opposite_spin_algorithm == "new") {
     // Use new algorithm with 3 sub-algorithms
@@ -1032,7 +1048,8 @@ void Hamiltonian<S>::generate_n_minus_2_cores(const HalfDet& half_det, std::vect
 template <class S>
 void Hamiltonian<S>::find_same_spin_excitations_loop_batch(const S& system, 
                                                            const std::vector<size_t>& new_det_indices,
-                                                           const std::vector<size_t>& old_det_indices) {
+                                                           const std::vector<size_t>& old_det_indices,
+                                                           bool processing_alpha_excitations) {
   // Step 4: Execute the Loop Algorithm on the Entire Batch
   // Simple O(N*N_new) nested loop over new determinants vs all determinants in group
   for (size_t new_det_id : new_det_indices) {
@@ -2233,65 +2250,153 @@ void Hamiltonian<S>::opposite_spin_subalg3(const S& system,
 // 2018 opposite-spin algorithm (current baseline)
 template <class S>
 void Hamiltonian<S>::find_opposite_spin_excitations_2018(const S& system) {
+  if (Parallel::is_master()) {
+    printf("DEBUG: *** INSIDE find_opposite_spin_excitations_2018 ***\n");
+    printf("DEBUG: Function called successfully!\n");
+  }
+  
   auto start_time = std::chrono::high_resolution_clock::now();
   
-  if (Parallel::is_master() && opposite_spin_debug_output) {
-    printf("Finding opposite-spin excitations using 2018 algorithm...\n");
+  const size_t n_unique_alphas = unique_alphas.size();
+  
+  if (Parallel::is_master()) {
+    printf("DEBUG: Finding opposite-spin excitations using 2018 algorithm...\n");
+    printf("DEBUG: n_unique_alphas = %zu\n", n_unique_alphas);
+    printf("DEBUG: unique_alphas.size() = %zu\n", unique_alphas.size());
+    
+    // Debug: print alpha singles info
+    for (size_t alpha_id = 0; alpha_id < n_unique_alphas && alpha_id < 5; alpha_id++) {
+      printf("DEBUG: alpha_id %zu has %zu singles\n", alpha_id, alpha_id_to_single_ids[alpha_id].size());
+    }
   }
   
   // Process connections between different unique alpha/beta pairs
-  const size_t n_unique_alphas = unique_alphas.size();
   
-  #pragma omp parallel for schedule(static, 1)
+  size_t total_connections_found = 0;
+  size_t total_checks_performed = 0;
+  
+  // Track which det pairs we've already added to avoid duplicates
+  std::set<std::pair<size_t, size_t>> added_pairs;
+  
+  // Remove parallel processing for debugging
   for (size_t alpha_id = 0; alpha_id < n_unique_alphas; alpha_id++) {
+    if (Parallel::is_master() && alpha_id < 3) {
+      printf("DEBUG: Processing alpha_id %zu\n", alpha_id);
+    }
+    
+    // Check for valid data structures
+    if (alpha_id >= alpha_id_to_single_ids.size()) {
+      if (Parallel::is_master()) {
+        printf("DEBUG: ERROR - alpha_id %zu >= alpha_id_to_single_ids.size() %zu\n", alpha_id, alpha_id_to_single_ids.size());
+      }
+      continue;
+    }
+    if (alpha_id >= alpha_id_to_beta_ids.size()) {
+      if (Parallel::is_master()) {
+        printf("DEBUG: ERROR - alpha_id %zu >= alpha_id_to_beta_ids.size() %zu\n", alpha_id, alpha_id_to_beta_ids.size());
+      }
+      continue;
+    }
+    if (alpha_id >= alpha_id_to_det_ids.size()) {
+      if (Parallel::is_master()) {
+        printf("DEBUG: ERROR - alpha_id %zu >= alpha_id_to_det_ids.size() %zu\n", alpha_id, alpha_id_to_det_ids.size());
+      }
+      continue;
+    }
+    
     const auto& single_alphas = alpha_id_to_single_ids[alpha_id];
     const auto& beta_ids = alpha_id_to_beta_ids[alpha_id];
     const auto& det_ids = alpha_id_to_det_ids[alpha_id];
     
     for (size_t j = 0; j < single_alphas.size(); j++) {
       const size_t alpha_single_id = single_alphas[j];
+      
+      // Check bounds for alpha_single_id
+      if (alpha_single_id >= alpha_id_to_beta_ids.size()) {
+        if (Parallel::is_master()) {
+          printf("DEBUG: ERROR - alpha_single_id %zu >= alpha_id_to_beta_ids.size() %zu\n", alpha_single_id, alpha_id_to_beta_ids.size());
+        }
+        continue;
+      }
+      if (alpha_single_id >= alpha_id_to_det_ids.size()) {
+        if (Parallel::is_master()) {
+          printf("DEBUG: ERROR - alpha_single_id %zu >= alpha_id_to_det_ids.size() %zu\n", alpha_single_id, alpha_id_to_det_ids.size());
+        }
+        continue;
+      }
+      
       const auto& single_beta_ids = alpha_id_to_beta_ids[alpha_single_id];
       const auto& single_det_ids = alpha_id_to_det_ids[alpha_single_id];
       
       // Find connections via single excitations in opposite spin
-      size_t k = 0;
-      size_t l = 0;
-      
-      while (k < beta_ids.size() && l < single_beta_ids.size()) {
-        if (beta_ids[k] < single_beta_ids[l]) {
-          k++;
-        } else if (beta_ids[k] > single_beta_ids[l]) {
-          l++;
-        } else {
-          // Found matching beta, check if it's connected via beta singles
-          const size_t beta_id = beta_ids[k];
-          const auto& beta_singles = time_sym ? alpha_id_to_single_ids[beta_id] : beta_id_to_single_ids[beta_id];
+      // For each beta with alpha_id
+      for (size_t k = 0; k < beta_ids.size(); k++) {
+        const size_t beta1_id = beta_ids[k];
+        const size_t det1_id = det_ids[k];
+        
+        // Get betas that are single-excitation connected to beta1
+        const auto& beta1_singles = time_sym ? alpha_id_to_single_ids[beta1_id] : beta_id_to_single_ids[beta1_id];
+        
+        // For each beta with alpha_single_id  
+        for (size_t l = 0; l < single_beta_ids.size(); l++) {
+          const size_t beta2_id = single_beta_ids[l];
+          const size_t det2_id = single_det_ids[l];
           
-          // Get the corresponding beta for the single alpha
-          const size_t single_beta_id = single_beta_ids[l];
+          // Only process connections involving at least one NEW determinant
+          // This is crucial for incremental updates
+          if (det1_id < n_dets_prev && det2_id < n_dets_prev) {
+            continue;  // Both determinants are old, skip
+          }
           
-          // Check if these betas are connected by a single excitation
-          bool found_connection = false;
-          for (size_t beta_single : beta_singles) {
-            if (beta_single == single_beta_id) {
-              found_connection = true;
+          // Check if beta1 and beta2 are single-excitation connected
+          bool betas_connected = false;
+          for (size_t beta_single : beta1_singles) {
+            if (beta_single == beta2_id) {
+              betas_connected = true;
               break;
             }
           }
           
-          if (found_connection) {
-            // Found opposite-spin connection
-            const size_t det_id = det_ids[k];
-            const size_t single_det_id = single_det_ids[l];
+          if (betas_connected) {
+            // Found opposite-spin connection: alpha1->alpha2 (single) AND beta1->beta2 (single)
+            total_checks_performed++;
             
-            const double H = time_sym ? system.get_hamiltonian_elem_time_sym(system.dets[det_id], system.dets[single_det_id], -1)
-                                      : system.get_hamiltonian_elem(system.dets[det_id], system.dets[single_det_id], -1);
-            if (std::abs(H) >= Util::EPS) {
-              matrix.append_elem(det_id, single_det_id, H);
+            // Debug: print first few matrix elements
+            static size_t debug_count = 0;
+            const bool debug_this = (debug_count < 20);
+            debug_count++;
+            
+            // Skip if this is not a valid opposite-spin connection
+            // We need BOTH conditions:
+            // 1. det1 and det2 differ by exactly 1 alpha excitation (already checked via alpha_id -> alpha_single_id)
+            // 2. det1 and det2 differ by exactly 1 beta excitation (already checked via beta connection)
+            // But we must avoid double-counting when the same pair is found through different paths
+            
+            // Ensure upper triangular and avoid duplicates
+            size_t row = std::min(det1_id, det2_id);
+            size_t col = std::max(det1_id, det2_id);
+            
+            if (row != col) {  // Skip diagonal
+              std::pair<size_t, size_t> det_pair(row, col);
+              
+              // Only add if we haven't seen this pair before
+              if (added_pairs.find(det_pair) == added_pairs.end()) {
+                added_pairs.insert(det_pair);
+                
+                const double H = time_sym ? system.get_hamiltonian_elem_time_sym(system.dets[row], system.dets[col], -1)
+                                          : system.get_hamiltonian_elem(system.dets[row], system.dets[col], -1);
+                if (debug_this && Parallel::is_master()) {
+                  printf("DEBUG OPPOSITE: det1=%zu det2=%zu H=%.10f (alpha %zu->%zu, beta %zu->%zu)\n", 
+                         row, col, H, alpha_id, alpha_single_id, beta1_id, beta2_id);
+                }
+                if (std::abs(H) >= Util::EPS) {
+                  matrix.append_elem(row, col, H);
+                  total_connections_found++;
+                }
+              }
             }
+            // If det1_id == det2_id, skip (diagonal elements are handled separately)
           }
-          k++;
-          l++;
         }
       }
     }
@@ -2302,8 +2407,14 @@ void Hamiltonian<S>::find_opposite_spin_excitations_2018(const S& system) {
   total_opposite_spin_2018_time += total_time;
   total_opposite_spin_2018_calls++;
   
-  if (Parallel::is_master() && opposite_spin_debug_output) {
-    printf("2018 opposite-spin excitations complete (time: %.3fs)\n", total_time);
+  if (Parallel::is_master()) {
+    printf("DEBUG: *** EXITING find_opposite_spin_excitations_2018 ***\n");
+    printf("DEBUG: Opposite-spin 2018 - Checked %zu potential connections, found %zu actual connections\n", 
+           total_checks_performed, total_connections_found);
+    printf("DEBUG: Added %zu unique determinant pairs\n", added_pairs.size());
+    if (opposite_spin_debug_output) {
+      printf("2018 opposite-spin excitations complete (time: %.3fs)\n", total_time);
+    }
   }
 }
 
