@@ -106,12 +106,17 @@ unsigned HalfDet::n_diffs(const HalfDet& rhs) const {
     uint64_t chunk_left = chunks[chunk_id];
     uint64_t chunk_right = rhs.chunks[chunk_id];
     if (chunk_left == chunk_right) continue;
-    uint64_t chunk_left_only = chunk_left & (~chunk_right);
+    uint64_t chunk_left_only = chunk_left & (~chunk_right);   // Bits in left but not right
+    uint64_t chunk_right_only = chunk_right & (~chunk_left);  // Bits in right but not left
     n_diffs += Util::popcnt(chunk_left_only);
+    n_diffs += Util::popcnt(chunk_right_only);
   }
 #ifdef INF_ORBS
   for (unsigned orb : extras) {
     if (rhs.extras.count(orb) == 0) n_diffs++;
+  }
+  for (unsigned orb : rhs.extras) {
+    if (extras.count(orb) == 0) n_diffs++;
   }
 #endif
   return n_diffs;
