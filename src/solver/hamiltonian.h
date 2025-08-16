@@ -237,7 +237,7 @@ Hamiltonian<S>::Hamiltonian() {
   n_dn = Config::get<unsigned>("n_dn");
   samespin_hash_threshold = Config::get<size_t>("samespin_hash_threshold", 1000);
   auto_tuning_samples = Config::get<size_t>("auto_tuning_samples", 20);
-  auto_tuning_enabled = Config::get<bool>("auto_tuning_enabled", true);
+  auto_tuning_enabled = Config::get<bool>("auto_tuning_enabled", false);
   use_reusable_hash_map = Config::get<bool>("use_reusable_hash_map", true);
   dynamic_threshold = samespin_hash_threshold;  // Initialize with static threshold
   
@@ -579,10 +579,7 @@ void Hamiltonian<S>::update_absingles(const S& system) {
 template <class S>
 void Hamiltonian<S>::update_matrix(const S& system) {
   if (Parallel::is_master()) {
-    printf("DEBUG: ======= ENTERING update_matrix =======\n");
-    printf("DEBUG: n_dets = %zu\n", system.get_n_dets());
-    printf("DEBUG: has_double_excitation = %s\n", system.has_double_excitation ? "true" : "false");
-    printf("DEBUG: time_sym = %s\n", time_sym ? "true" : "false");
+    // Removed debug output for performance
   }
   
   matrix.set_dim(system.get_n_dets());
@@ -596,15 +593,15 @@ void Hamiltonian<S>::update_matrix(const S& system) {
     reusable_core_map_.reserve(100000);
   }
   
-  // Perform auto-tuning calibration at the start of each macro-iteration
-  if (auto_tuning_enabled && Parallel::is_master()) {
+  // Perform auto-tuning calibration only for adaptive algorithm
+  if (same_spin_algorithm == "adaptive" && auto_tuning_enabled && Parallel::is_master()) {
     perform_auto_tuning_calibration(system);
   }
 
   // Step 1: Group All Determinants by HalfDet
   // Always use half-det grouping approach
   if (Parallel::is_master()) {
-    printf("DEBUG: same_spin_algorithm = '%s'\n", same_spin_algorithm.c_str());
+    // Removed debug output for performance
   }
 
   // Map from a HalfDet spin-string to all determinant indices that contain it.
@@ -711,7 +708,8 @@ void Hamiltonian<S>::update_matrix(const S& system) {
     } else {
       // Default to 2018 algorithm
       algorithm_chosen = "2018";
-      find_same_spin_excitations_2018_batch(system, new_det_indices, old_det_indices, processing_alpha_excitations);
+      // Map 2018 to loop algorithm for backward compatibility
+      find_same_spin_excitations_loop_batch(system, new_det_indices, old_det_indices, processing_alpha_excitations);
       total_2018_batch_calls++;
     }
     
@@ -816,7 +814,8 @@ void Hamiltonian<S>::update_matrix(const S& system) {
     } else {
       // Default to 2018 algorithm
       algorithm_chosen = "2018";
-      find_same_spin_excitations_2018_batch(system, new_det_indices, old_det_indices, processing_alpha_excitations);
+      // Map 2018 to loop algorithm for backward compatibility
+      find_same_spin_excitations_loop_batch(system, new_det_indices, old_det_indices, processing_alpha_excitations);
       total_2018_batch_calls++;
     }
     
@@ -836,10 +835,7 @@ void Hamiltonian<S>::update_matrix(const S& system) {
   auto opposite_spin_start_time = std::chrono::high_resolution_clock::now();
   
   if (Parallel::is_master()) {
-    printf("DEBUG: About to call opposite_spin_algorithm: '%s'\n", opposite_spin_algorithm.c_str());
-    printf("DEBUG: has_double_excitation = %s, time_sym = %s\n", 
-           system.has_double_excitation ? "true" : "false",
-           time_sym ? "true" : "false");
+    // Removed debug output for performance
   }
   
   if (opposite_spin_algorithm == "2018") {
@@ -882,10 +878,10 @@ void Hamiltonian<S>::update_matrix(const S& system) {
   auto end_hamiltonian_time = std::chrono::high_resolution_clock::now();
   total_hamiltonian_time = std::chrono::duration<double>(end_hamiltonian_time - start_hamiltonian_time).count();
   
-  // Print timing summary
-  print_timing_summary();
-  print_per_alpha_summary();
-  print_auto_tuning_report();
+  // Print timing summary - disabled for performance
+  // print_timing_summary();
+  // print_per_alpha_summary();
+  // print_auto_tuning_report();
 }
 
 // Removed: Non-batch same-spin algorithms that violated DESIGN_DOC.md architecture
@@ -1013,7 +1009,9 @@ void Hamiltonian<S>::find_same_spin_excitations_hash_batch(const S& system,
   for (size_t new_det_id : new_det_indices) {
     const auto& new_det = system.dets[new_det_id];
     
-    generate_n_minus_2_cores(new_det.dn, generated_cores);
+    // Use correct spin channel based on excitation type
+    const auto& spin_channel = is_alpha_excitation ? new_det.up : new_det.dn;
+    generate_n_minus_2_cores(spin_channel, generated_cores);
     std::set<size_t> visited_pairs;
     
     for (const auto& core : generated_cores) {
@@ -1211,12 +1209,7 @@ void Hamiltonian<S>::select_calibration_targets(std::vector<std::pair<size_t, si
   size_t min_size = 50;
   size_t max_size = 3000;
   
-  // Debug: Print all group sizes to understand distribution
-  printf("DEBUG: All alpha group sizes: ");
-  for (size_t i = 0; i < std::min(all_groups.size(), (size_t)20); i++) {
-    printf("%zu ", all_groups[i].second);
-  }
-  printf("... (showing first 20)\n");
+  // Removed debug output for performance
   
   // Filter groups within the target size range
   std::vector<std::pair<size_t, size_t>> filtered_groups;
@@ -1248,12 +1241,7 @@ void Hamiltonian<S>::select_calibration_targets(std::vector<std::pair<size_t, si
   printf("Calibration range: [%zu, %zu] determinants (absolute), sampling %zu groups from %zu candidates\n",
          min_size, max_size, targets.size(), filtered_groups.size());
          
-  // Debug: Print sizes of all selected calibration targets
-  printf("DEBUG: Selected calibration group sizes: ");
-  for (const auto& target : targets) {
-    printf("%zu ", target.second);
-  }
-  printf("\n");
+  // Removed debug output for performance
 }
 
 // Time a single algorithm for calibration (timing-only, no matrix updates)
@@ -1762,10 +1750,7 @@ void Hamiltonian<S>::opposite_spin_candidates(const S& system,
                                       : system.get_hamiltonian_elem(system.dets[row], system.dets[col], -1);
             if (std::abs(H) >= Util::EPS) {
               matrix.append_elem(row, col, H);
-              static int debug_count = 0;
-              if (debug_count++ < 10) {
-                printf("  CANDIDATES: Adding elem[%zu,%zu] = %.6f\n", row, col, H);
-              }
+              // Removed debug output for performance
             }
           }
         }
@@ -1897,7 +1882,7 @@ void Hamiltonian<S>::opposite_spin_pairwise(const S& system,
     if (up_j_it == setup_data.up_to_full_map.end()) continue;
     
     // DEBUG: Print which up-spin pair is being processed and their down-spin lists
-    if (debug_counter <= 2) {
+    if (false /* was debug_counter */ <= 2) {
       printf("  Processing up_pair: %zu -> %zu\n", up_idx, up_j_idx);
       printf("    u_i group has %zu dets: [", up_i_it->second.size());
       for (size_t i = 0; i < up_i_it->second.size(); i++) {
@@ -1928,7 +1913,7 @@ void Hamiltonian<S>::opposite_spin_pairwise(const S& system,
         const Det& det_j = system.dets[full_idx_j];
         
         // Debug: Print first few comparisons
-        if (debug_counter <= 1 && total_comparisons <= 8) {
+        if (false /* was debug_counter */ <= 1 && total_comparisons <= 8) {
           int n_diffs = det_i.dn.n_diffs(det_j.dn);
           printf("    Comparing [%zu] vs [%zu]: up_diffs=%d, dn_diffs=%d\n", 
                  full_idx_i, full_idx_j, det_i.up.n_diffs(det_j.up), n_diffs);
@@ -1941,7 +1926,7 @@ void Hamiltonian<S>::opposite_spin_pairwise(const S& system,
         // u_i -> u_j is single excitation (already ensured)
         // d_i -> d_j must also be single excitation
         bool is_dn_single = is_single_excitation(det_i.dn, det_j.dn);
-        if (debug_counter <= 1 && total_comparisons <= 8) {
+        if (false /* was debug_counter */ <= 1 && total_comparisons <= 8) {
           int n_diffs_dn = det_i.dn.n_diffs(det_j.dn);
           printf("      n_diffs(dn)=%d, is_single_excitation(dn)=%s\n", 
                  n_diffs_dn, is_dn_single ? "true" : "false");
@@ -1955,16 +1940,16 @@ void Hamiltonian<S>::opposite_spin_pairwise(const S& system,
           if (row != col) {  // Skip diagonal elements
             const double H = time_sym ? system.get_hamiltonian_elem_time_sym(system.dets[row], system.dets[col], -1)
                                       : system.get_hamiltonian_elem(system.dets[row], system.dets[col], -1);
-            if (debug_counter <= 1 && total_comparisons <= 8) {
+            if (false /* was debug_counter */ <= 1 && total_comparisons <= 8) {
               printf("      H_elem[%zu,%zu] = %.8f, EPS=%.2e\n", row, col, H, Util::EPS);
             }
             if (std::abs(H) >= Util::EPS) {
               matrix.append_elem(row, col, H);
               connections_found++;
-            } else if (debug_counter <= 1 && total_comparisons <= 8) {
+            } else if (false /* was debug_counter */ <= 1 && total_comparisons <= 8) {
               printf("      SKIPPED: |H|=%.8f < EPS=%.2e\n", std::abs(H), Util::EPS);
             }
-          } else if (debug_counter <= 1 && total_comparisons <= 8) {
+          } else if (false /* was debug_counter */ <= 1 && total_comparisons <= 8) {
             printf("      SKIPPED: diagonal element\n");
           }
         }
@@ -1981,8 +1966,7 @@ void Hamiltonian<S>::find_opposite_spin_excitations_candidates(const S& system) 
   auto start_time = std::chrono::high_resolution_clock::now();
   
   if (Parallel::is_master()) {
-    printf("DEBUG: *** INSIDE find_opposite_spin_excitations_candidates ***\n");
-    printf("DEBUG: Using dnCandidates method for all groups\n");
+    // Removed debug output for performance
   }
   
   // Setup data structures
@@ -2020,8 +2004,7 @@ void Hamiltonian<S>::find_opposite_spin_excitations_candidates(const S& system) 
   double total_time = std::chrono::duration<double>(end_time - start_time).count();
   
   if (Parallel::is_master()) {
-    printf("DEBUG: *** EXITING find_opposite_spin_excitations_candidates ***\n");
-    printf("DEBUG: Candidates algorithm complete (time: %.3fs)\n", total_time);
+    // Removed debug output for performance
   }
 }
 
@@ -2031,8 +2014,7 @@ void Hamiltonian<S>::find_opposite_spin_excitations_removal(const S& system) {
   auto start_time = std::chrono::high_resolution_clock::now();
   
   if (Parallel::is_master()) {
-    printf("DEBUG: *** INSIDE find_opposite_spin_excitations_removal ***\n");
-    printf("DEBUG: Using N-1 electron removal method for all groups\n");
+    // Removed debug output for performance
   }
   
   // Setup data structures
@@ -2068,8 +2050,7 @@ void Hamiltonian<S>::find_opposite_spin_excitations_removal(const S& system) {
   double total_time = std::chrono::duration<double>(end_time - start_time).count();
   
   if (Parallel::is_master()) {
-    printf("DEBUG: *** EXITING find_opposite_spin_excitations_removal ***\n");
-    printf("DEBUG: Removal algorithm complete (time: %.3fs)\n", total_time);
+    // Removed debug output for performance
   }
 }
 
@@ -2079,8 +2060,7 @@ void Hamiltonian<S>::find_opposite_spin_excitations_pairwise(const S& system) {
   auto start_time = std::chrono::high_resolution_clock::now();
   
   if (Parallel::is_master()) {
-    printf("DEBUG: *** INSIDE find_opposite_spin_excitations_pairwise ***\n");
-    printf("DEBUG: Using direct pairwise comparison for all groups\n");
+    // Removed debug output for performance
   }
   
   // Setup data structures
@@ -2116,7 +2096,7 @@ void Hamiltonian<S>::find_opposite_spin_excitations_pairwise(const S& system) {
   double total_time = std::chrono::duration<double>(end_time - start_time).count();
   
   if (Parallel::is_master()) {
-    printf("DEBUG: *** EXITING find_opposite_spin_excitations_pairwise ***\n");
+    // Removed debug output for performance
     printf("DEBUG: Pairwise algorithm complete (time: %.3fs)\n", total_time);
   }
 }
