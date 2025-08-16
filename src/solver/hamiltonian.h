@@ -98,14 +98,7 @@ class Hamiltonian {
 
   void sort_by_first(std::vector<size_t>& vec1, std::vector<size_t>& vec2);
 
-  // N-2 core hashing methods for same-spin excitations
-  void find_same_spin_excitations_loop(const S& system, size_t det_id, 
-                                       const std::vector<size_t>& beta_dets, 
-                                       size_t start_id);
-  
-  void find_same_spin_excitations_hash(const S& system, size_t det_id,
-                                       const std::vector<size_t>& beta_dets,
-                                       size_t start_id);
+  // Removed: Non-batch same-spin algorithms (violated DESIGN_DOC.md architecture)
                                        
   // Batch versions for group-based processing
   void find_same_spin_excitations_loop_batch(const S& system, 
@@ -131,8 +124,7 @@ class Hamiltonian {
   // Cornell-style 2018 algorithm refactored for alpha-grouping
   void find_excitations_cornell_style_2018(const S& system);
   
-  void find_opposite_spin_excitations_new(const S& system, 
-                                          const HamiltonianSetupData& setup_data);
+  // Removed: find_opposite_spin_excitations_new (functionality merged into adaptive)
   
   // Sub-algorithms for new opposite-spin method
   void opposite_spin_candidates(const S& system,
@@ -180,15 +172,9 @@ class Hamiltonian {
   // Opposite-spin timing (detailed breakdown)
   double total_opposite_spin_time = 0.0;
   double total_opposite_spin_2018_time = 0.0;
-  double total_opposite_spin_new_time = 0.0;
-  double total_opposite_spin_subalg1_time = 0.0;
-  double total_opposite_spin_subalg2_time = 0.0;
-  double total_opposite_spin_subalg3_time = 0.0;
+  // Removed: timing variables for old "new" framework (merged into adaptive)
   size_t total_opposite_spin_2018_calls = 0;
-  size_t total_opposite_spin_new_calls = 0;
-  size_t total_opposite_spin_subalg1_calls = 0;
-  size_t total_opposite_spin_subalg2_calls = 0;
-  size_t total_opposite_spin_subalg3_calls = 0;
+  // Removed: call count variables for old "new" framework (merged into adaptive)
   
   // Legacy compatibility (maps to adaptive algorithm)
   double total_loop_time = 0.0;
@@ -873,14 +859,10 @@ void Hamiltonian<S>::update_matrix(const S& system) {
   } else if (opposite_spin_algorithm == "loop") {
     // Backward compatibility: map "loop" to "pairwise"
     find_opposite_spin_excitations_pairwise(system);
-  } else if (opposite_spin_algorithm == "new") {
-    // Legacy "new" framework with 3 sub-algorithms
-    HamiltonianSetupData setup_data = setup_variational_hamiltonian(system.dets);
-    find_opposite_spin_excitations_new(system, setup_data);
   } else {
     // ERROR: No fallback allowed!
     printf("ERROR: Invalid opposite_spin_algorithm: '%s'\n", opposite_spin_algorithm.c_str());
-    printf("Valid options: 2018, candidates, removal, pairwise, adaptive, hash, loop, new\n");
+    printf("Valid options: 2018, candidates, removal, pairwise, adaptive, hash, loop\n");
     throw std::runtime_error("Invalid opposite_spin_algorithm: " + opposite_spin_algorithm);
   }
   
@@ -906,134 +888,8 @@ void Hamiltonian<S>::update_matrix(const S& system) {
   print_auto_tuning_report();
 }
 
-// Original 2018 algorithm for same-spin excitations
-template <class S>
-void Hamiltonian<S>::find_same_spin_excitations_loop(const S& system, size_t det_id,
-                                                      const std::vector<size_t>& beta_dets,
-                                                      size_t start_id) {
-  const auto& det = system.dets[det_id];
-  
-  // Diagnostic: Print beta_dets size for 2018 method
-  static size_t call_count = 0;
-  static size_t total_beta_dets = 0;
-  static size_t max_beta_dets = 0;
-  static size_t min_beta_dets = SIZE_MAX;
-  
-  call_count++;
-  total_beta_dets += beta_dets.size();
-  if (beta_dets.size() > max_beta_dets) max_beta_dets = beta_dets.size();
-  if (beta_dets.size() < min_beta_dets) min_beta_dets = beta_dets.size();
-  
-  if (call_count % 10000 == 0 || call_count <= 10) {
-    printf("2018 Method - Call %zu: beta_dets=%zu\n", call_count, beta_dets.size());
-  }
-  
-  if (call_count % 50000 == 0) {
-    printf("2018 Method Stats after %zu calls:\n", call_count);
-    printf("  Average beta_dets per call: %.1f\n", double(total_beta_dets) / call_count);
-    printf("  Max beta_dets: %zu\n", max_beta_dets);
-    printf("  Min beta_dets: %zu\n", min_beta_dets);
-  }
-  
-  for (auto it = beta_dets.begin(); it != beta_dets.end(); it++) {
-    const size_t beta_det_id = *it;
-    if (beta_det_id < start_id) continue;
-    const auto& connected_det = system.dets[beta_det_id];
-    const double H = time_sym ? system.get_hamiltonian_elem_time_sym(det, connected_det, -1)
-                              : system.get_hamiltonian_elem(det, connected_det, -1);
-    if (std::abs(H) < Util::EPS) continue;
-    matrix.append_elem(det_id, beta_det_id, H);
-  }
-}
-
-// N-2 core hashing algorithm for same-spin excitations
-template <class S>
-void Hamiltonian<S>::find_same_spin_excitations_hash(const S& system, size_t det_id,
-                                                      const std::vector<size_t>& beta_dets,
-                                                      size_t start_id) {
-  const auto& det = system.dets[det_id];
-  
-  // Diagnostic: Count metrics for N-2 hashing method
-  static size_t call_count = 0;
-  static size_t total_beta_dets = 0;
-  static size_t total_n2_cores = 0;
-  static size_t max_beta_dets = 0;
-  static size_t min_beta_dets = SIZE_MAX;
-  static size_t max_n2_cores = 0;
-  static size_t min_n2_cores = SIZE_MAX;
-  
-  call_count++;
-  total_beta_dets += beta_dets.size();
-  if (beta_dets.size() > max_beta_dets) max_beta_dets = beta_dets.size();
-  if (beta_dets.size() < min_beta_dets) min_beta_dets = beta_dets.size();
-  
-  // Calculate number of N-2 electron pairs for this determinant
-  size_t n_electrons = det.dn.get_occupied_orbs().size();
-  size_t n2_pairs = (n_electrons * (n_electrons - 1)) / 2;  // C(N,2)
-  total_n2_cores += n2_pairs;
-  if (n2_pairs > max_n2_cores) max_n2_cores = n2_pairs;
-  if (n2_pairs < min_n2_cores) min_n2_cores = n2_pairs;
-  
-  // Print metrics (show whichever is smaller: beta_dets or n2_pairs)
-  size_t limiting_factor = std::min(beta_dets.size(), n2_pairs);
-  
-  if (call_count % 10000 == 0 || call_count <= 10) {
-    printf("N-2 Hash Method - Call %zu: beta_dets=%zu, n2_pairs=%zu, limiting=%zu\n", 
-           call_count, beta_dets.size(), n2_pairs, limiting_factor);
-  }
-  
-  if (call_count % 50000 == 0) {
-    printf("N-2 Hash Method Stats after %zu calls:\n", call_count);
-    printf("  Average beta_dets per call: %.1f\n", double(total_beta_dets) / call_count);
-    printf("  Average n2_pairs per call: %.1f\n", double(total_n2_cores) / call_count);
-    printf("  Max beta_dets: %zu, Max n2_pairs: %zu\n", max_beta_dets, max_n2_cores);
-    printf("  Min beta_dets: %zu, Min n2_pairs: %zu\n", min_beta_dets, min_n2_cores);
-  }
-  
-  // Single reusable vector for core generation to avoid repeated allocations
-  std::vector<HalfDet> generated_cores;
-  generated_cores.reserve(n2_pairs);
-  
-  // Track keys added during this call for selective cleanup (not used in local approach)
-  // std::vector<HalfDet> keys_added_this_call;
-  
-  // Always use local hash map approach for thread safety
-  // Fallback to original local hash map approach
-  std::unordered_map<HalfDet, std::vector<size_t>, HalfDetHasher> local_core_map;
-  
-  for (auto it = beta_dets.begin(); it != beta_dets.end(); it++) {
-    const size_t beta_det_id = *it;
-    if (beta_det_id < start_id) continue;
-    
-    const auto& beta_det = system.dets[beta_det_id];
-    
-    // Generate all N-2 cores for this beta determinant  
-    generate_n_minus_2_cores(beta_det.dn, generated_cores);
-    for (const auto& core : generated_cores) {
-      local_core_map[core].push_back(beta_det_id);
-    }
-  }
-  
-  // Query Phase: Find connections for the current determinant
-  generate_n_minus_2_cores(det.dn, generated_cores);
-  std::set<size_t> visited_pairs;  // Avoid duplicates from multiple cores
-  
-  for (const auto& core : generated_cores) {
-    auto it = local_core_map.find(core);
-    if (it != local_core_map.end()) {
-      for (size_t connected_det_id : it->second) {
-        if (visited_pairs.find(connected_det_id) != visited_pairs.end()) continue;
-        visited_pairs.insert(connected_det_id);
-        
-        const auto& connected_det = system.dets[connected_det_id];
-        const double H = time_sym ? system.get_hamiltonian_elem_time_sym(det, connected_det, -1)
-                                  : system.get_hamiltonian_elem(det, connected_det, -1);
-        if (std::abs(H) < Util::EPS) continue;
-        matrix.append_elem(det_id, connected_det_id, H);
-      }
-    }
-  }
-}
+// Removed: Non-batch same-spin algorithms that violated DESIGN_DOC.md architecture
+// These functions used determinant-by-determinant processing instead of half-det grouping
 
 // Generate all N-2 electron cores from a half-determinant
 template <class S>
@@ -1222,7 +1078,7 @@ void Hamiltonian<S>::print_timing_summary() const {
     }
     
     // Opposite-spin timing breakdown
-    double computed_opposite_spin_time = total_opposite_spin_2018_time + total_opposite_spin_new_time;
+    double computed_opposite_spin_time = total_opposite_spin_2018_time;
     
     printf("\nOpposite-spin excitation timing breakdown:\n");
     if (total_opposite_spin_2018_calls > 0) {
@@ -1231,25 +1087,7 @@ void Hamiltonian<S>::print_timing_summary() const {
       printf("    Total time: %.6f seconds\n", total_opposite_spin_2018_time);
       printf("    Average time per call: %.9f seconds\n", total_opposite_spin_2018_time / total_opposite_spin_2018_calls);
     }
-    if (total_opposite_spin_new_calls > 0) {
-      printf("  New Algorithm (with sub-algorithms):\n");
-      printf("    Total calls: %zu\n", total_opposite_spin_new_calls);
-      printf("    Total time: %.6f seconds\n", total_opposite_spin_new_time);
-      printf("    Average time per call: %.9f seconds\n", total_opposite_spin_new_time / total_opposite_spin_new_calls);
-      
-      if (total_opposite_spin_subalg1_calls > 0) {
-        printf("    Sub-algorithm 1 (Hash existing): %zu calls, %.6fs\n", 
-               total_opposite_spin_subalg1_calls, total_opposite_spin_subalg1_time);
-      }
-      if (total_opposite_spin_subalg2_calls > 0) {
-        printf("    Sub-algorithm 2 (Hash N-1): %zu calls, %.6fs\n", 
-               total_opposite_spin_subalg2_calls, total_opposite_spin_subalg2_time);
-      }
-      if (total_opposite_spin_subalg3_calls > 0) {
-        printf("    Sub-algorithm 3 (Direct): %zu calls, %.6fs\n", 
-               total_opposite_spin_subalg3_calls, total_opposite_spin_subalg3_time);
-      }
-    }
+    // Note: Adaptive algorithm timing now integrated into total_opposite_spin_time
     printf("  Total opposite-spin time: %.6f seconds\n", computed_opposite_spin_time);
     if (total_hamiltonian_time > 0) {
       printf("  Opposite-spin fraction: %.2f%%\n", 100.0 * computed_opposite_spin_time / total_hamiltonian_time);
@@ -1848,144 +1686,7 @@ double Hamiltonian<S>::estimate_opposite_spin_pairwise_cost(size_t n_dn_i, size_
   return n_up_singles * n_dn_i * avg_dn_j;
 }
 
-// Main function to find opposite-spin excitations using the new algorithm
-template <class S>
-void Hamiltonian<S>::find_opposite_spin_excitations_new(const S& system, 
-                                                       const HamiltonianSetupData& setup_data) {
-  auto start_time = std::chrono::high_resolution_clock::now();
-  
-  if (Parallel::is_master() && opposite_spin_debug_output) {
-    printf("Finding opposite-spin excitations using new algorithm...\n");
-  }
-  
-  // Statistics for algorithm selection
-  size_t total_subalg1_calls = 0;
-  size_t total_subalg2_calls = 0;
-  size_t total_subalg3_calls = 0;
-  
-  // Main loop over unique up-spin determinants (sorted by importance)
-  for (size_t up_idx = 0; up_idx < setup_data.unique_up_dets.size(); up_idx++) {
-    const HalfDet& u_i = setup_data.unique_up_dets[up_idx];
-    
-    // Get down-spin determinants for this up-spin
-    auto up_it = setup_data.up_to_full_map.find(u_i);
-    if (up_it == setup_data.up_to_full_map.end()) continue;
-    
-    std::vector<size_t> dn_indices_i;
-    for (size_t full_idx : up_it->second) {
-      const Det& det = system.dets[full_idx];
-      auto dn_idx_it = setup_data.dn_det_to_idx.find(det.dn);
-      if (dn_idx_it != setup_data.dn_det_to_idx.end()) {
-        dn_indices_i.push_back(dn_idx_it->second);
-      }
-    }
-    
-    // Get up-spin singles for this determinant
-    auto singles_it = setup_data.upSingles.find(up_idx);
-    if (singles_it == setup_data.upSingles.end()) continue;
-    
-    const std::vector<size_t>& up_singles = singles_it->second;
-    if (up_singles.empty()) continue;
-    
-    // Calculate cost estimates for algorithm selection
-    size_t n_dn_i = dn_indices_i.size();
-    size_t n_up_singles = up_singles.size();
-    
-    // Estimate average down-spin properties
-    size_t avg_dn_singles = 0;
-    size_t avg_dn_j = 0;
-    size_t sample_size = std::min(size_t(5), up_singles.size());
-    
-    for (size_t i = 0; i < sample_size; i++) {
-      const HalfDet& u_j = setup_data.unique_up_dets[up_singles[i]];
-      auto up_j_it = setup_data.up_to_full_map.find(u_j);
-      if (up_j_it != setup_data.up_to_full_map.end()) {
-        avg_dn_j += up_j_it->second.size();
-      }
-    }
-    avg_dn_j = (sample_size > 0) ? avg_dn_j / sample_size : 1;
-    
-    // Estimate average dn singles connections
-    sample_size = std::min(size_t(5), dn_indices_i.size());
-    for (size_t i = 0; i < sample_size; i++) {
-      auto dn_singles_it = setup_data.dnSingles.find(dn_indices_i[i]);
-      if (dn_singles_it != setup_data.dnSingles.end()) {
-        avg_dn_singles += dn_singles_it->second.size();
-      }
-    }
-    avg_dn_singles = (sample_size > 0) ? avg_dn_singles / sample_size : 10;
-    
-    // Choose algorithm based on cost model or user preference
-    std::string chosen_algorithm;
-    auto subalg_start_time = std::chrono::high_resolution_clock::now();
-    
-    if (opposite_spin_cost_model == "subalg1") {
-      chosen_algorithm = "subalg1";
-      opposite_spin_candidates(system, setup_data, up_idx, dn_indices_i, up_singles);
-      total_subalg1_calls++;
-    } else if (opposite_spin_cost_model == "subalg2") {
-      chosen_algorithm = "subalg2";
-      opposite_spin_removal(system, setup_data, up_idx, dn_indices_i, up_singles);
-      total_subalg2_calls++;
-    } else if (opposite_spin_cost_model == "subalg3") {
-      chosen_algorithm = "subalg3";
-      opposite_spin_pairwise(system, setup_data, up_idx, dn_indices_i, up_singles);
-      total_subalg3_calls++;
-    } else {  // "auto" - choose based on estimated costs
-      double cost1 = estimate_opposite_spin_candidates_cost(n_dn_i, n_up_singles, avg_dn_singles, avg_dn_j);
-      double cost2 = estimate_opposite_spin_removal_cost(n_dn_i, n_up_singles, avg_dn_j, n_dn);
-      double cost3 = estimate_opposite_spin_pairwise_cost(n_dn_i, n_up_singles, avg_dn_j);
-      
-      if (cost1 <= cost2 && cost1 <= cost3) {
-        chosen_algorithm = "subalg1";
-        opposite_spin_candidates(system, setup_data, up_idx, dn_indices_i, up_singles);
-        total_subalg1_calls++;
-      } else if (cost2 <= cost3) {
-        chosen_algorithm = "subalg2";
-        opposite_spin_removal(system, setup_data, up_idx, dn_indices_i, up_singles);
-        total_subalg2_calls++;
-      } else {
-        chosen_algorithm = "subalg3";
-        opposite_spin_pairwise(system, setup_data, up_idx, dn_indices_i, up_singles);
-        total_subalg3_calls++;
-      }
-    }
-    
-    auto subalg_end_time = std::chrono::high_resolution_clock::now();
-    double subalg_time = std::chrono::duration<double>(subalg_end_time - subalg_start_time).count();
-    
-    // Update timing statistics
-    if (chosen_algorithm == "subalg1") {
-      total_opposite_spin_subalg1_time += subalg_time;
-    } else if (chosen_algorithm == "subalg2") {
-      total_opposite_spin_subalg2_time += subalg_time;
-    } else {
-      total_opposite_spin_subalg3_time += subalg_time;
-    }
-    
-    if (opposite_spin_debug_output && up_idx % 100 == 0) {
-      printf("  Up %zu: %s (n_dn=%zu, n_up_singles=%zu, time=%.3fms)\n", 
-             up_idx, chosen_algorithm.c_str(), n_dn_i, n_up_singles, subalg_time * 1000);
-    }
-  }
-  
-  auto end_time = std::chrono::high_resolution_clock::now();
-  double total_time = std::chrono::duration<double>(end_time - start_time).count();
-  total_opposite_spin_new_time += total_time;
-  total_opposite_spin_new_calls++;
-  
-  // Update sub-algorithm call counts
-  total_opposite_spin_subalg1_calls += total_subalg1_calls;
-  total_opposite_spin_subalg2_calls += total_subalg2_calls;
-  total_opposite_spin_subalg3_calls += total_subalg3_calls;
-  
-  if (Parallel::is_master() && opposite_spin_debug_output) {
-    printf("Opposite-spin excitations complete. Sub-algorithm usage:\n");
-    printf("  Sub-algorithm 1: %zu calls\n", total_subalg1_calls);
-    printf("  Sub-algorithm 2: %zu calls\n", total_subalg2_calls);
-    printf("  Sub-algorithm 3: %zu calls\n", total_subalg3_calls);
-  }
-}
+// Removed: find_opposite_spin_excitations_new (functionality merged into adaptive)
 
 // Sub-algorithm 1: Hash existing connections
 template <class S>
@@ -2460,28 +2161,59 @@ void Hamiltonian<S>::find_opposite_spin_excitations_adaptive(const S& system) {
     const std::vector<size_t>& up_singles = singles_it->second;
     if (up_singles.empty()) continue;
     
-    // Calculate cost estimates for algorithm selection
+    // Calculate cost estimates for algorithm selection with proper estimation
     size_t n_dn_i = dn_indices_i.size();
     size_t n_up_singles = up_singles.size();
     
-    // Simplified cost estimation (use default values for now)
-    size_t avg_dn_singles = 10;
-    size_t avg_dn_j = 2;
+    // Estimate average down-spin properties (merged from "new" framework)
+    size_t avg_dn_singles = 0;
+    size_t avg_dn_j = 0;
+    size_t sample_size = std::min(size_t(5), up_singles.size());
     
-    // Choose algorithm based on cost model
-    double cost1 = estimate_opposite_spin_candidates_cost(n_dn_i, n_up_singles, avg_dn_singles, avg_dn_j);
-    double cost2 = estimate_opposite_spin_removal_cost(n_dn_i, n_up_singles, avg_dn_j, n_dn);
-    double cost3 = estimate_opposite_spin_pairwise_cost(n_dn_i, n_up_singles, avg_dn_j);
+    for (size_t i = 0; i < sample_size; i++) {
+      const HalfDet& u_j = setup_data.unique_up_dets[up_singles[i]];
+      auto up_j_it = setup_data.up_to_full_map.find(u_j);
+      if (up_j_it != setup_data.up_to_full_map.end()) {
+        avg_dn_j += up_j_it->second.size();
+      }
+    }
+    avg_dn_j = (sample_size > 0) ? avg_dn_j / sample_size : 1;
     
-    if (cost1 <= cost2 && cost1 <= cost3) {
+    // Estimate average dn singles connections
+    sample_size = std::min(size_t(5), dn_indices_i.size());
+    for (size_t i = 0; i < sample_size; i++) {
+      auto dn_singles_it = setup_data.dnSingles.find(dn_indices_i[i]);
+      if (dn_singles_it != setup_data.dnSingles.end()) {
+        avg_dn_singles += dn_singles_it->second.size();
+      }
+    }
+    avg_dn_singles = (sample_size > 0) ? avg_dn_singles / sample_size : 10;
+    
+    // Choose algorithm based on configuration or cost model (merged from "new" framework)
+    if (opposite_spin_cost_model == "subalg1" || opposite_spin_cost_model == "candidates") {
       opposite_spin_candidates(system, setup_data, up_idx, dn_indices_i, up_singles);
       total_candidates_calls++;
-    } else if (cost2 <= cost3) {
+    } else if (opposite_spin_cost_model == "subalg2" || opposite_spin_cost_model == "removal") {
       opposite_spin_removal(system, setup_data, up_idx, dn_indices_i, up_singles);
       total_removal_calls++;
-    } else {
+    } else if (opposite_spin_cost_model == "subalg3" || opposite_spin_cost_model == "pairwise") {
       opposite_spin_pairwise(system, setup_data, up_idx, dn_indices_i, up_singles);
       total_pairwise_calls++;
+    } else {  // "auto" - choose based on estimated costs
+      double cost1 = estimate_opposite_spin_candidates_cost(n_dn_i, n_up_singles, avg_dn_singles, avg_dn_j);
+      double cost2 = estimate_opposite_spin_removal_cost(n_dn_i, n_up_singles, avg_dn_j, n_dn);
+      double cost3 = estimate_opposite_spin_pairwise_cost(n_dn_i, n_up_singles, avg_dn_j);
+      
+      if (cost1 <= cost2 && cost1 <= cost3) {
+        opposite_spin_candidates(system, setup_data, up_idx, dn_indices_i, up_singles);
+        total_candidates_calls++;
+      } else if (cost2 <= cost3) {
+        opposite_spin_removal(system, setup_data, up_idx, dn_indices_i, up_singles);
+        total_removal_calls++;
+      } else {
+        opposite_spin_pairwise(system, setup_data, up_idx, dn_indices_i, up_singles);
+        total_pairwise_calls++;
+      }
     }
   }
   
