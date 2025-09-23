@@ -35,14 +35,14 @@ Arrow is a research program rather than a fully tested catch-all software packag
 ## History and Authorship
 The Heat-Bath Configuration Interaction (HCI) method was invented by **Adam A. Holmes** as a deterministic analogue of his earlier heat-bath sampling algorithm, following a suggestion from his advisor **Cyrus Umrigar** that such an analogue might be possible.
 
-The subsequent semistochastic variant (SHCI) was developed through a collaborative effort between the groups of **Umrigar** at Cornell and **Ali Alavi** at the Max Planck Institute, with key contributions from **Holmes**, **Umrigar**, **Sandeep Sharma**, and **Alavi**. Continued development of SHCI has been a joint effort between Holmes, Umrigar, and Sharma, and their research groups.
+The subsequent semistochastic variant (SHCI) was developed through a collaborative effort between researchers in the groups of **Umrigar** at Cornell and **Ali Alavi** at the Max Planck Institute, with key contributions from **Holmes**, **Umrigar**, **Sandeep Sharma**, and **Alavi**. Continued development of SHCI has been a joint effort between Holmes, Umrigar, and Sharma, and their research groups.
 
-**Arrow** is the modern, high-performance C++ implementation of these methods. The initial implementation was written by **Junhao Li** and was later significantly extended by **Yuan Yao** and **Tyler Anderson**. It features algorithms, some of which have been improved, that were first realized in Holmes's original FORTRAN implementation, which was parallelized by **Matt Otten**.
+**Arrow** is the modern, high-performance C++ implementation of these methods. The initial implementation was written by **Junhao Li** and was later significantly extended by **Yuan Yao** and **Tyler Anderson**. Its architecture is based on ports of algorithms from Holmes's original FORTRAN implementation (which was parallelized by **Matt Otten**), many of which have been significantly improved.
 
 This fork is maintained by the original inventor and contains additional improvements and new research directions.
 
 ## Developer notes
-The performance of Arrow is excellent and in many cases significantly exceeds that of the original FORTRAN code. However, several advanced algorithms from the original implementation, for example for the efficient calculation of diagonal matrix elements, have not yet been ported to the C++ version. Re-implementing Holmes's original efficient routines could offer a significant additional performance boost and would be a valuable direction for future development. Interested developers are encouraged to consult the original HCI/SHCI papers for details.
+The performance of Arrow is excellent and in many cases significantly exceeds that of the original FORTRAN code. However, several advanced algorithms from the original implementation, for example for the efficient calculation of diagonal matrix elements, have not yet been ported to the C++ version. Re-implementing the original, more efficient routines from Holmes's FORTRAN code could offer a significant additional performance boost and would be a valuable direction for future development. Interested developers are encouraged to consult the original HCI/SHCI papers for details.
 
 ## Citations
 Any papers that use Arrow should cite the following foundational papers:
