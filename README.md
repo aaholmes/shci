@@ -37,7 +37,7 @@ The Heat-Bath Configuration Interaction (HCI) method was invented by **Adam A. H
 
 The subsequent semistochastic variant (SHCI) was developed through a collaborative effort between the groups of **Umrigar** at Cornell and **Ali Alavi** at the Max Planck Institute, with key contributions from **Holmes**, **Umrigar**, **Sandeep Sharma**, and **Alavi**. Continued development of SHCI has been a joint effort between Holmes, Umrigar, and Sharma, and their research groups.
 
-**Arrow** is the modern, high-performance C++ implementation of these methods. The initial implementation was written by **Junhao Li** and was later significantly extended by **Yuan Yao** and **Tyler Anderson**. It features algorithms that were first realized in Holmes's original FORTRAN implementation, which was parallelized by **Matt Otten**.
+**Arrow** is the modern, high-performance C++ implementation of these methods. The initial implementation was written by **Junhao Li** and was later significantly extended by **Yuan Yao** and **Tyler Anderson**. It features algorithms, some of which have been improved, that were first realized in Holmes's original FORTRAN implementation, which was parallelized by **Matt Otten**.
 
 This fork contains additional improvements and new research directions by the original inventor.
 
