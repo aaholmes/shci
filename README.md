@@ -39,10 +39,10 @@ The subsequent semistochastic variant (SHCI) was developed through a collaborati
 
 **Arrow** is the modern, high-performance C++ implementation of these methods. The initial implementation was written by **Junhao Li** and was later significantly extended by **Yuan Yao** and **Tyler Anderson**. It features algorithms, some of which have been improved, that were first realized in Holmes's original FORTRAN implementation, which was parallelized by **Matt Otten**.
 
-This fork contains additional improvements and new research directions by the original inventor.
+This fork is maintained by the original inventor and contains additional improvements and new research directions.
 
 ## Developer notes
-The performance of Arrow is excellent and in many cases significantly exceeds that of the original FORTRAN code. However, several advanced algorithms from the original implementation, for example for the efficient calculation of diagonal matrix elements, have not yet been ported to the C++ version. Re-implementing these specific routines could offer a significant additional performance boost and would be a valuable direction for future development. Interested developers are encouraged to consult the original HCI/SHCI papers for details.
+The performance of Arrow is excellent and in many cases significantly exceeds that of the original FORTRAN code. However, several advanced algorithms from the original implementation, for example for the efficient calculation of diagonal matrix elements, have not yet been ported to the C++ version. Re-implementing Holmes's original efficient routines could offer a significant additional performance boost and would be a valuable direction for future development. Interested developers are encouraged to consult the original HCI/SHCI papers for details.
 
 ## Citations
 Any papers that use Arrow should cite the following foundational papers:
