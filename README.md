@@ -2,9 +2,7 @@
 
 A high-performance implementation of the Semistochastic Heat-Bath Configuration Interaction (SHCI) method.
 
-Arrow is a selected configuration interaction plus perturbation theory (SCI+PT) method for obtaining highly accurate, near-Full CI energies for challenging quantum chemistry problems. The underlying HCI and SHCI algorithms have innovations that make them among the fastest and most powerful SCI methods available. Arrow enables massively parallel computations using a hybrid MPI+OpenMP implementation.
-
-[![Build Status](https://travis-ci.com/QMC-Cornell/shci.svg?token=Gy8pVWtUBHq57qdtpAKN&branch=master)](https://travis-ci.com/QMC-Cornell/shci)
+Arrow is a selected configuration interaction plus perturbation theory (SCI+PT) codebase for obtaining highly accurate, near-Full CI energies for challenging electronic structure problems. The underlying HCI and SHCI algorithms have innovations that make them among the fastest and most powerful SCI methods available. Arrow enables massively parallel computations using a hybrid MPI+OpenMP implementation.
 
 ## Installation
 
@@ -30,7 +28,7 @@ make -j
 Instructions for running Arrow are documented in the [wiki](https://github.com/QMC-Cornell/shci/wiki).
 
 ## How to Contribute
-Arrow is a research program rather than a fully tested catch-all software package. The efficiency and correctness of edge cases, or input values that differ greatly from the default or published values, are not guaranteed. We welcome help with extending the capabilities of Arrow. If interested, please contact Adam Holmes <adamaholmes@gmail.com> or Cyrus Umrigar <CyrusUmrigar@cornell.edu>.
+Arrow is a research program rather than a fully tested catch-all software package. The efficiency and correctness of edge cases, or input values that differ greatly from the default or published values, are not guaranteed. We welcome help with extending the capabilities of Arrow. If interested, please contact Adam Holmes <adamaholmes@gmail.com>.
 
 ## History and Authorship
 The Heat-Bath Configuration Interaction (HCI) method was invented by **Adam A. Holmes** as a deterministic analogue of his earlier heat-bath sampling algorithm, following a suggestion from his advisor **Cyrus Umrigar** that such an analogue might be possible.
