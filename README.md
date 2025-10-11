@@ -31,9 +31,9 @@ Instructions for running Arrow are documented in the [wiki](https://github.com/Q
 Arrow is a research program rather than a fully tested catch-all software package. The efficiency and correctness of edge cases, or input values that differ greatly from the default or published values, are not guaranteed. We welcome help with extending the capabilities of Arrow. If interested, please contact Adam Holmes <adamaholmes@gmail.com>.
 
 ## History and Authorship
-The Heat-Bath Configuration Interaction (HCI) method was invented by **Adam A. Holmes** as a deterministic analogue of his earlier heat-bath sampling algorithm, following a suggestion from his advisor **Cyrus Umrigar** that such an analogue might be possible.
+The Heat-Bath Configuration Interaction (HCI) method was invented by **Adam A. Holmes** as a deterministic analogue of his earlier heat-bath sampling algorithm, following a suggestion from his PhD advisor **Cyrus Umrigar** that such an analogue might be possible.
 
-The subsequent semistochastic variant (SHCI) was developed through a collaborative effort between researchers in the groups of **Umrigar** at Cornell and **Ali Alavi** at the Max Planck Institute, with key contributions from **Holmes**, **Umrigar**, **Sandeep Sharma**, and **Alavi**. Continued development of SHCI has been a joint effort between Holmes, Umrigar, and Sharma, and their research groups.
+Holmes then shared a preprint of his HCI paper with **Sandeep Sharma**, after which Holmes, Umrigar, and Sharma developed a semistochastic approach to the perturbative step with **Ali Alavi**, Sharma's postdoc advisor at the time. This semistochastic variant was given the name SHCI. Continued development of SHCI has been primarily a joint effort by Holmes and the Umrigar and Sharma research groups.
 
 **Arrow** is the modern, high-performance C++ implementation of these methods. The initial implementation was written by **Junhao Li** and was later significantly extended by **Yuan Yao** and **Tyler Anderson**. Its architecture is based on ports of algorithms from Holmes's original FORTRAN implementation (which was parallelized by **Matt Otten**), many of which have been significantly improved.
 
